@@ -2,6 +2,9 @@
 //!
 //!   cargo run --release --example bench -- [nodes] [appends] [data_dir]
 
+// Older compilers need more room to prove the spawned futures Send.
+#![recursion_limit = "256"]
+
 use mycelium::{Node, Peer};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

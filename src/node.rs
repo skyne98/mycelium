@@ -452,9 +452,19 @@ impl Shared {
                 Err(Some(leader)) => match &forward {
                     None => return Err("not the leader".into()),
                     Some((role, body)) => {
-                        match self.call_peer(leader, *role, body.clone(), DEADLINE).await {
-                            Ok(out) => return index(&out),
-                            Err(e) => why = e.to_string(),
+                        // A leader killed outright closes nothing, so waiting
+                        // on it can take the whole deadline. Retry as soon as
+                        // a new leader is known: (client, seq) makes it safe.
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        tokio::select! {
+                            r = self.call_peer(leader, *role, body.clone(), left) => match r {
+                                Ok(out) => return index(&out),
+                                Err(e) => why = e.to_string(),
+                            },
+                            _ = self.leader_moved(leader) => {
+                                why = format!("{leader} stopped leading");
+                                continue;
+                            }
                         }
                     }
                 },
@@ -462,6 +472,20 @@ impl Shared {
             }
             if self.pause(&mut rx, deadline).await.is_err() {
                 return Err(format!("write failed: {why}").into());
+            }
+        }
+    }
+
+    /// Resolves once this node knows a leader other than `from` (itself
+    /// included), or stops.
+    async fn leader_moved(&self, from: SocketAddr) {
+        let mut rx = self.changed.subscribe();
+        loop {
+            if self.stopped() || self.core().leader.is_some_and(|l| l != from) {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
             }
         }
     }
@@ -1585,7 +1609,7 @@ impl Shared {
         recv.read_exact(&mut role).await?;
         let body = transport::get(&mut recv).await?;
         let reply = if role[0] == JOIN {
-            Box::pin(self.handle_join(&names, &body)).await
+            Box::pin(self.handle_join(&caller, &names, &body)).await
         } else if !self.allowed(&caller) {
             Err("this client's certificate is not allowed".into())
         } else if role[0] == FOLLOW {
@@ -1753,13 +1777,20 @@ impl Shared {
     }
 
     /// Joins arrive from nodes that are not members yet, so they are checked
-    /// against the certificate, not the membership.
-    async fn handle_join(self: &Arc<Self>, conn_names: &[String], body: &[u8]) -> Result<Vec<u8>> {
+    /// against the caller's certificate. A join relayed by a member was
+    /// checked by that member, whose own certificate is what arrives here.
+    async fn handle_join(
+        self: &Arc<Self>,
+        caller: &Caller,
+        conn_names: &[String],
+        body: &[u8],
+    ) -> Result<Vec<u8>> {
         let m = decode_members(body)?
             .into_iter()
             .next()
             .ok_or("empty join")?;
-        if self.secure {
+        let relayed = matches!(caller, Caller::Peer(_));
+        if self.secure && !relayed {
             let name = m
                 .name
                 .as_deref()
