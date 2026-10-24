@@ -317,7 +317,9 @@ impl Core {
         if i < self.snap_index {
             return None;
         }
-        self.log.get((i - self.snap_index - 1) as usize).map(|e| e.term)
+        self.log
+            .get((i - self.snap_index - 1) as usize)
+            .map(|e| e.term)
     }
 
     #[cfg(test)]
@@ -400,10 +402,17 @@ impl Core {
             return Err("another membership change is still in progress".into());
         }
         let addrs = |c: &[Member], voters: bool| -> HashSet<SocketAddr> {
-            c.iter().filter(|m| m.voter || !voters).map(|m| m.addr).collect()
+            c.iter()
+                .filter(|m| m.voter || !voters)
+                .map(|m| m.addr)
+                .collect()
         };
-        let members = addrs(&self.config, false).symmetric_difference(&addrs(&config, false)).count();
-        let voters = addrs(&self.config, true).symmetric_difference(&addrs(&config, true)).count();
+        let members = addrs(&self.config, false)
+            .symmetric_difference(&addrs(&config, false))
+            .count();
+        let voters = addrs(&self.config, true)
+            .symmetric_difference(&addrs(&config, true))
+            .count();
         if members > 1 || voters > 1 {
             return Err("change one server at a time".into());
         }
@@ -645,7 +654,12 @@ impl Core {
 
     /// Shared by AppendEntries and InstallSnapshot: a current leader resets
     /// this node's timer. Err carries this node's newer term.
-    fn accept_leader(&mut self, term: u64, leader: SocketAddr, now: Instant) -> std::result::Result<(), u64> {
+    fn accept_leader(
+        &mut self,
+        term: u64,
+        leader: SocketAddr,
+        now: Instant,
+    ) -> std::result::Result<(), u64> {
         if self.io_error.is_some() || term < self.term {
             return Err(self.term);
         }
@@ -671,7 +685,10 @@ impl Core {
         if req.prev_index >= self.snap_index {
             if let Some(t) = self.term_at(req.prev_index).filter(|t| *t != req.prev_term) {
                 if req.prev_index <= self.commit {
-                    self.stop(format!("log diverged below the commit index at {}", req.prev_index));
+                    self.stop(format!(
+                        "log diverged below the commit index at {}",
+                        req.prev_index
+                    ));
                     return fail(self.term, 0);
                 }
                 // Skip back over the whole conflicting term in one round trip.
@@ -713,7 +730,12 @@ impl Core {
     }
 
     /// One chunk of a snapshot arrived: Err(term) if the sender is stale.
-    pub fn handle_snapshot_chunk(&mut self, term: u64, leader: SocketAddr, now: Instant) -> std::result::Result<(), u64> {
+    pub fn handle_snapshot_chunk(
+        &mut self,
+        term: u64,
+        leader: SocketAddr,
+        now: Instant,
+    ) -> std::result::Result<(), u64> {
         self.accept_leader(term, leader, now)
     }
 
@@ -872,7 +894,14 @@ impl Core {
         fresh >= self.quorum()
     }
 
-    fn reply_from(&mut self, peer: SocketAddr, term: u64, sent_term: u64, sent_at: Instant, now: Instant) -> bool {
+    fn reply_from(
+        &mut self,
+        peer: SocketAddr,
+        term: u64,
+        sent_term: u64,
+        sent_at: Instant,
+        now: Instant,
+    ) -> bool {
         self.clock = self.clock.max(now);
         if term > self.term {
             self.become_follower(term, None);
@@ -921,7 +950,15 @@ impl Core {
     }
 
     /// The follower installed a snapshot ending at `index`.
-    pub fn on_snapshot_resp(&mut self, peer: SocketAddr, sent_term: u64, index: u64, resp: AppendResp, sent_at: Instant, now: Instant) -> bool {
+    pub fn on_snapshot_resp(
+        &mut self,
+        peer: SocketAddr,
+        sent_term: u64,
+        index: u64,
+        resp: AppendResp,
+        sent_at: Instant,
+        now: Instant,
+    ) -> bool {
         if !self.reply_from(peer, resp.term, sent_term, sent_at, now) || !resp.ok {
             return false;
         }
@@ -938,18 +975,17 @@ impl Core {
         if self.role != Role::Leader {
             return false;
         }
-        let live = self
-            .config
-            .iter()
-            .filter(|m| m.voter)
-            .filter(|m| {
-                m.addr == self.me
-                    || self
-                        .progress
-                        .get(&m.addr)
-                        .is_some_and(|p| now.saturating_duration_since(p.last_ack) < ELECTION_MIN)
-            })
-            .count();
+        let live =
+            self.config
+                .iter()
+                .filter(|m| m.voter)
+                .filter(|m| {
+                    m.addr == self.me
+                        || self.progress.get(&m.addr).is_some_and(|p| {
+                            now.saturating_duration_since(p.last_ack) < ELECTION_MIN
+                        })
+                })
+                .count();
         if live < self.quorum() {
             let term = self.term;
             self.become_follower(term, None);
@@ -967,7 +1003,9 @@ impl Core {
     }
 
     pub fn caught_up(&self, peer: SocketAddr) -> bool {
-        self.progress.get(&peer).is_some_and(|p| p.matched >= self.last_index())
+        self.progress
+            .get(&peer)
+            .is_some_and(|p| p.matched >= self.last_index())
     }
 
     // ---------------------------------------------------------------- disk
@@ -1024,7 +1062,10 @@ impl Core {
     /// Enough has been applied since the last snapshot: take one. Without a
     /// disk the log is simply cut.
     pub fn snapshot_job(&mut self) -> Option<SnapshotJob> {
-        if self.snapshotting || self.io_error.is_some() || self.applied < self.snap_index + self.snapshot_every.max(1) {
+        if self.snapshotting
+            || self.io_error.is_some()
+            || self.applied < self.snap_index + self.snapshot_every.max(1)
+        {
             return None;
         }
         let job = SnapshotJob {
@@ -1049,7 +1090,9 @@ impl Core {
             return;
         }
         self.snapshot = Some(snap);
-        let Some(term) = self.term_at(index) else { return };
+        let Some(term) = self.term_at(index) else {
+            return;
+        };
         self.log.drain(..(index - self.snap_index) as usize);
         self.snap_index = index;
         self.snap_term = term;
@@ -1084,7 +1127,8 @@ impl Core {
             snapshot: self.snapshot.as_deref().cloned(),
         };
         let (rng, every) = (self.rng, self.snapshot_every);
-        let mut fresh = Core::new(self.me, self.bootstrap.clone(), None, loaded, now).expect("restart");
+        let mut fresh =
+            Core::new(self.me, self.bootstrap.clone(), None, loaded, now).expect("restart");
         fresh.rng = rng;
         fresh.snapshot_every = every;
         fresh.reset_deadline(now);
@@ -1103,7 +1147,13 @@ pub(crate) struct Retention {
 }
 
 /// The body of an append: `parts[name, client, seq, keep_last, max_age_ms, payload...]`.
-pub(crate) fn append_body(name: &str, client: u64, seq: u64, r: Retention, payloads: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn append_body(
+    name: &str,
+    client: u64,
+    seq: u64,
+    r: Retention,
+    payloads: &[&[u8]],
+) -> Vec<u8> {
     let nums = [client, seq, r.keep_last, r.max_age_ms].map(u64::to_be_bytes);
     let mut pieces: Vec<&[u8]> = vec![name.as_bytes()];
     pieces.extend(nums.iter().map(|n| &n[..]));
@@ -1128,7 +1178,9 @@ pub(crate) fn append_command(body: &[u8], now_ms: u64) -> Result<Bytes> {
     while !b.is_empty() {
         b.take()?;
     }
-    Ok(Bytes::from([&[APPEND][..], &now_ms.to_be_bytes(), body].concat()))
+    Ok(Bytes::from(
+        [&[APPEND][..], &now_ms.to_be_bytes(), body].concat(),
+    ))
 }
 
 pub(crate) fn wall_ms() -> u64 {
@@ -1139,13 +1191,25 @@ pub(crate) fn wall_ms() -> u64 {
 
 /// Drop every entry of `name` before `before`.
 pub(crate) fn trim_command(name: &str, before: u64) -> Bytes {
-    Bytes::from([&[TRIM][..], &parts(&[name.as_bytes(), &before.to_be_bytes()])].concat())
+    Bytes::from(
+        [
+            &[TRIM][..],
+            &parts(&[name.as_bytes(), &before.to_be_bytes()]),
+        ]
+        .concat(),
+    )
 }
 
 pub(crate) fn encode_config(c: &[Member]) -> Vec<u8> {
     let rows: Vec<(String, String, [u8; 1])> = c
         .iter()
-        .map(|m| (m.addr.to_string(), m.name.clone().unwrap_or_default(), [m.voter as u8]))
+        .map(|m| {
+            (
+                m.addr.to_string(),
+                m.name.clone().unwrap_or_default(),
+                [m.voter as u8],
+            )
+        })
         .collect();
     let pieces: Vec<&[u8]> = rows
         .iter()
@@ -1190,11 +1254,19 @@ impl StreamLog {
     fn excess(&self, now_ms: u64) -> usize {
         let mut n = 0;
         if self.policy.keep_last > 0 {
-            n = self.entries.len().saturating_sub(self.policy.keep_last as usize);
+            n = self
+                .entries
+                .len()
+                .saturating_sub(self.policy.keep_last as usize);
         }
         if self.policy.max_age_ms > 0 {
             let cutoff = now_ms.saturating_sub(self.policy.max_age_ms);
-            n = n.max(self.entries.iter().take_while(|(ts, _)| *ts < cutoff).count());
+            n = n.max(
+                self.entries
+                    .iter()
+                    .take_while(|(ts, _)| *ts < cutoff)
+                    .count(),
+            );
         }
         n
     }
@@ -1242,7 +1314,10 @@ impl Machine {
     }
 
     fn append(&mut self, cmd: &Bytes) -> u64 {
-        let Some(ts) = cmd.get(..8).map(|t| u64::from_be_bytes(t.try_into().unwrap())) else {
+        let Some(ts) = cmd
+            .get(..8)
+            .map(|t| u64::from_be_bytes(t.try_into().unwrap()))
+        else {
             return 0;
         };
         let body = cmd.slice(8..);
@@ -1301,7 +1376,13 @@ impl Machine {
             Some(s) => {
                 let start = from.max(s.base);
                 let skip = (start - s.base) as usize;
-                let out = s.entries.iter().skip(skip).take(max).map(|(_, e)| e.clone()).collect();
+                let out = s
+                    .entries
+                    .iter()
+                    .skip(skip)
+                    .take(max)
+                    .map(|(_, e)| e.clone())
+                    .collect();
                 (start, out)
             }
             None => (from, Vec::new()),
@@ -1330,7 +1411,12 @@ impl Machine {
         for name in names {
             let s = &self.streams[name];
             put(&mut out, name.as_bytes());
-            for n in [s.base, s.policy.keep_last, s.policy.max_age_ms, s.entries.len() as u64] {
+            for n in [
+                s.base,
+                s.policy.keep_last,
+                s.policy.max_age_ms,
+                s.entries.len() as u64,
+            ] {
                 put(&mut out, &n.to_be_bytes());
             }
             for (ts, e) in &s.entries {
@@ -1373,7 +1459,14 @@ impl Machine {
                 let ts = b.u64()?;
                 entries.push_back((ts, bytes.slice_ref(b.take()?)));
             }
-            m.streams.insert(name, StreamLog { base, entries, policy });
+            m.streams.insert(
+                name,
+                StreamLog {
+                    base,
+                    entries,
+                    policy,
+                },
+            );
         }
         for row in b.take()?.as_chunks::<24>().0 {
             let v = |i: usize| u64::from_be_bytes(row[i * 8..i * 8 + 8].try_into().unwrap());
@@ -1546,7 +1639,14 @@ impl VoteResp {
 impl SnapChunk {
     pub fn encode(&self) -> Vec<u8> {
         let leader = self.leader.to_string();
-        let nums = [self.term, self.index, self.snap_term, self.offset, self.total].map(u64::to_be_bytes);
+        let nums = [
+            self.term,
+            self.index,
+            self.snap_term,
+            self.offset,
+            self.total,
+        ]
+        .map(u64::to_be_bytes);
         let mut pieces: Vec<&[u8]> = vec![leader.as_bytes()];
         pieces.extend(nums.iter().map(|n| &n[..]));
         pieces.push(&self.data);

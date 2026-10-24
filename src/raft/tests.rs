@@ -60,7 +60,11 @@ impl Net {
         let initial: Vec<Member> = addrs[..members].iter().copied().map(voter).collect();
         let nodes = (0..n)
             .map(|i| {
-                let boot = if i < members { initial.clone() } else { Vec::new() };
+                let boot = if i < members {
+                    initial.clone()
+                } else {
+                    Vec::new()
+                };
                 let mut c = Core::new(addrs[i], boot, None, Loaded::default(), epoch).unwrap();
                 c.rng = seed.wrapping_mul(31).wrapping_add(i as u64 * 7919) | 1;
                 c.reset_deadline(epoch);
@@ -113,11 +117,16 @@ impl Net {
         }
         let delay = 1 + self.rand() % 30;
         self.seq += 1;
-        self.queue.insert((self.now_ms + delay, self.seq), (from, to, m));
+        self.queue
+            .insert((self.now_ms + delay, self.seq), (from, to, m));
     }
 
     fn ask_votes(&mut self, i: usize, req: VoteReq) {
-        let voters: Vec<usize> = self.nodes[i].other_voters().into_iter().map(|a| self.idx(a)).collect();
+        let voters: Vec<usize> = self.nodes[i]
+            .other_voters()
+            .into_iter()
+            .map(|a| self.idx(a))
+            .collect();
         for j in voters {
             self.send(i, j, Msg::Vote(req));
         }
@@ -251,7 +260,8 @@ impl Net {
                 assert_eq!(prev, me, "two leaders in term {}", c.term);
             }
             c.become_leader(now);
-            self.log.push(format!("{} n{me} leads t{}", self.now_ms, c.term));
+            self.log
+                .push(format!("{} n{me} leads t{}", self.now_ms, c.term));
         }
     }
 
@@ -261,7 +271,8 @@ impl Net {
         c.start_election(now);
         let req = c.vote_req(false, force);
         self.votes[me].insert(c.term, me);
-        self.log.push(format!("{} n{me} campaigns t{}", self.now_ms, req.term));
+        self.log
+            .push(format!("{} n{me} campaigns t{}", self.now_ms, req.term));
         if self.nodes[me].quorum() == 1 {
             let c = &mut self.nodes[me];
             self.leaders.insert(c.term, me);
@@ -278,7 +289,9 @@ impl Net {
             for k in c.snap_index + 1..=c.commit {
                 let e = c.entry(k).expect("committed entry missing").clone();
                 match self.committed.get(&k) {
-                    Some(prev) => assert_eq!(prev, &e, "node {i} committed a different entry at {k}"),
+                    Some(prev) => {
+                        assert_eq!(prev, &e, "node {i} committed a different entry at {k}")
+                    }
                     None => {
                         self.committed.insert(k, e);
                     }
@@ -294,14 +307,23 @@ impl Net {
                 for k in (lo + 1..=hi).rev() {
                     if x.term_at(k) == y.term_at(k) {
                         for j in lo + 1..=k {
-                            assert_eq!(x.entry(j), y.entry(j), "logs {a},{b} differ at {j} under {k}");
+                            assert_eq!(
+                                x.entry(j),
+                                y.entry(j),
+                                "logs {a},{b} differ at {j} under {k}"
+                            );
                         }
                         break;
                     }
                 }
                 // Same applied index, same state.
                 if x.applied == y.applied {
-                    assert_eq!(x.machine.len("s"), y.machine.len("s"), "nodes {a},{b} diverged at {}", x.applied);
+                    assert_eq!(
+                        x.machine.len("s"),
+                        y.machine.len("s"),
+                        "nodes {a},{b} diverged at {}",
+                        x.applied
+                    );
                 }
             }
         }
@@ -343,7 +365,10 @@ impl Net {
         self.nodes[l].propose(cmd).ok()
     }
 
-    fn reconfigure(&mut self, edit: impl FnOnce(&mut Vec<Member>)) -> Option<oneshot::Receiver<Outcome>> {
+    fn reconfigure(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<Member>),
+    ) -> Option<oneshot::Receiver<Outcome>> {
         let l = self.leader()?;
         let mut cfg = self.nodes[l].config.clone();
         edit(&mut cfg);
@@ -403,15 +428,25 @@ fn a_partitioned_leader_steps_down_and_its_writes_are_discarded() {
     net.step(3000);
     let new = net.leader().expect("majority side elects");
     assert_ne!(new, old);
-    assert!(!net.nodes[old].is_leader(), "CheckQuorum demotes the isolated leader");
+    assert!(
+        !net.nodes[old].is_leader(),
+        "CheckQuorum demotes the isolated leader"
+    );
     let mut kept = net.propose().unwrap();
     net.step(500);
     net.cut[old] = false;
     net.step(2000);
-    assert!(matches!(lost.try_recv(), Ok(Err(_))), "isolated write must fail, not hang");
+    assert!(
+        matches!(lost.try_recv(), Ok(Err(_))),
+        "isolated write must fail, not hang"
+    );
     assert!(done(&mut kept));
     let want = net.nodes[new].machine.len("s");
-    assert_eq!(net.nodes[old].machine.len("s"), want, "old leader repaired its log");
+    assert_eq!(
+        net.nodes[old].machine.len("s"),
+        want,
+        "old leader repaired its log"
+    );
 }
 
 #[test]
@@ -424,7 +459,11 @@ fn a_rejoining_node_does_not_disrupt_the_leader() {
     net.step(5000);
     net.cut[f] = false;
     net.step(2000);
-    assert_eq!(net.leader(), Some(l), "PreVote keeps the cut-off node from deposing the leader");
+    assert_eq!(
+        net.leader(),
+        Some(l),
+        "PreVote keeps the cut-off node from deposing the leader"
+    );
     assert_eq!(net.nodes[l].term, term, "no term inflation from the rejoin");
 }
 
@@ -438,16 +477,30 @@ fn crash_restart_keeps_term_and_vote() {
     net.step(500);
     for i in 0..3 {
         let now = net.now();
-        let (t, v, n) = (net.nodes[i].term, net.nodes[i].voted_for, net.nodes[i].last_index());
+        let (t, v, n) = (
+            net.nodes[i].term,
+            net.nodes[i].voted_for,
+            net.nodes[i].last_index(),
+        );
         net.nodes[i].crash_and_restart(now);
-        assert_eq!((net.nodes[i].term, net.nodes[i].voted_for, net.nodes[i].last_index()), (t, v, n));
+        assert_eq!(
+            (
+                net.nodes[i].term,
+                net.nodes[i].voted_for,
+                net.nodes[i].last_index()
+            ),
+            (t, v, n)
+        );
         net.step(3000);
     }
     settle(&mut net);
     net.propose().unwrap();
     net.step(1000);
     let lens: Vec<u64> = net.nodes.iter().map(|c| c.machine.len("s")).collect();
-    assert!(lens.iter().all(|l| *l == lens[0] && *l >= 5), "logs converge after restarts: {lens:?}");
+    assert!(
+        lens.iter().all(|l| *l == lens[0] && *l >= 5),
+        "logs converge after restarts: {lens:?}"
+    );
 }
 
 #[test]
@@ -455,11 +508,19 @@ fn retries_apply_exactly_once() {
     let mut net = Net::new(3, 5);
     let l = settle(&mut net);
     let body = append_body("s", 42, 1, Retention::default(), &[b"once"]);
-    let mut a = net.nodes[l].propose(append_command(&body, 0).unwrap()).unwrap();
-    let mut b = net.nodes[l].propose(append_command(&body, 0).unwrap()).unwrap();
+    let mut a = net.nodes[l]
+        .propose(append_command(&body, 0).unwrap())
+        .unwrap();
+    let mut b = net.nodes[l]
+        .propose(append_command(&body, 0).unwrap())
+        .unwrap();
     net.step(500);
     assert_eq!(a.try_recv().unwrap(), Ok(0));
-    assert_eq!(b.try_recv().unwrap(), Ok(0), "the duplicate reports the original index");
+    assert_eq!(
+        b.try_recv().unwrap(),
+        Ok(0),
+        "the duplicate reports the original index"
+    );
     assert_eq!(net.nodes[l].machine.len("s"), 1);
 }
 
@@ -477,14 +538,30 @@ fn compaction_and_snapshots_bring_a_far_behind_node_back() {
         net.step(20);
     }
     net.step(500);
-    assert!(net.nodes[l].snap_index >= 40, "the leader compacted: {}", dump(&net));
-    assert!(net.nodes[l].last_index() - net.nodes[l].snap_index < 20, "and dropped the old log");
+    assert!(
+        net.nodes[l].snap_index >= 40,
+        "the leader compacted: {}",
+        dump(&net)
+    );
+    assert!(
+        net.nodes[l].last_index() - net.nodes[l].snap_index < 20,
+        "and dropped the old log"
+    );
     net.down[f] = false;
     net.step(2000);
-    assert_eq!(net.nodes[f].machine.len("s"), 50, "snapshot plus tail restored it:\n{}", dump(&net));
+    assert_eq!(
+        net.nodes[f].machine.len("s"),
+        50,
+        "snapshot plus tail restored it:\n{}",
+        dump(&net)
+    );
     let now = net.now();
     net.nodes[f].crash_and_restart(now);
-    assert_eq!(net.nodes[f].machine.len("s"), 50, "and it survives a restart from the snapshot");
+    assert_eq!(
+        net.nodes[f].machine.len("s"),
+        50,
+        "and it survives a restart from the snapshot"
+    );
 }
 
 #[test]
@@ -502,12 +579,23 @@ fn membership_changes_one_server_at_a_time() {
     });
     assert!(two.is_none(), "two changes at once are refused");
 
-    let mut add = net.reconfigure(|c| c.push(Member { voter: false, ..voter(new) })).unwrap();
+    let mut add = net
+        .reconfigure(|c| {
+            c.push(Member {
+                voter: false,
+                ..voter(new)
+            })
+        })
+        .unwrap();
     net.step(1000);
     assert!(done(&mut add), "learner added:\n{}", dump(&net));
     assert_eq!(net.nodes[3].machine.len("s"), 5, "the learner caught up");
     let l = net.leader().unwrap();
-    assert_eq!(net.nodes[l].quorum(), 2, "a learner does not raise the quorum");
+    assert_eq!(
+        net.nodes[l].quorum(),
+        2,
+        "a learner does not raise the quorum"
+    );
 
     let mut promote = net
         .reconfigure(|c| c.iter_mut().find(|m| m.addr == new).unwrap().voter = true)
@@ -545,12 +633,20 @@ fn leadership_transfer_skips_the_election_timeout() {
     assert!(net.nodes[t].timeout_now(term, me));
     net.campaign(t, true);
     net.step(200);
-    assert_eq!(net.leader(), Some(t), "took over in 200 ms, far under the timeout:\n{}", dump(&net));
+    assert_eq!(
+        net.leader(),
+        Some(t),
+        "took over in 200 ms, far under the timeout:\n{}",
+        dump(&net)
+    );
 }
 
 #[test]
 fn chaos_keeps_every_safety_property() {
-    let seeds: u64 = std::env::var("CHAOS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let seeds: u64 = std::env::var("CHAOS_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     for seed in 1..=seeds {
         let n = if seed % 2 == 0 { 5 } else { 3 };
         let mut net = Net::new(n, seed);

@@ -187,7 +187,11 @@ impl Wal {
         &self.dir
     }
 
-    pub fn state_job(&self, term: u64, vote: Option<SocketAddr>) -> impl FnOnce() -> io::Result<()> {
+    pub fn state_job(
+        &self,
+        term: u64,
+        vote: Option<SocketAddr>,
+    ) -> impl FnOnce() -> io::Result<()> {
         let dir = self.dir.clone();
         move || write_state(&dir, term, vote)
     }
@@ -260,7 +264,11 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[i] = c;
@@ -324,14 +332,23 @@ mod tests {
         drop(w);
         let path = d.join("log");
         let len = std::fs::metadata(&path).unwrap().len();
-        OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 3).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
 
         let (mut w, l) = Wal::open(&d).unwrap();
         assert_eq!(l.entries, vec![(1, b"whole".to_vec())]);
         w.append(2, b"after").unwrap();
         drop(w);
         let (_, l) = Wal::open(&d).unwrap();
-        assert_eq!(l.entries.len(), 2, "appends after a cut tail must be readable");
+        assert_eq!(
+            l.entries.len(),
+            2,
+            "appends after a cut tail must be readable"
+        );
     }
 
     #[test]
@@ -341,12 +358,22 @@ mod tests {
         for i in 1..=10u64 {
             w.append(1, &i.to_be_bytes()).unwrap();
         }
-        let tail: Vec<(u64, Vec<u8>)> = (9..=10u64).map(|i| (1, i.to_be_bytes().to_vec())).collect();
-        w.reset(8, tail.iter().map(|(t, c)| (*t, c.as_slice()))).unwrap();
+        let tail: Vec<(u64, Vec<u8>)> =
+            (9..=10u64).map(|i| (1, i.to_be_bytes().to_vec())).collect();
+        w.reset(8, tail.iter().map(|(t, c)| (*t, c.as_slice())))
+            .unwrap();
         w.append(2, &11u64.to_be_bytes()).unwrap();
         w.truncate(11).unwrap();
         w.append(3, b"eleven").unwrap();
-        write_snapshot(&d, &Snapshot { index: 8, term: 1, data: b"machine".to_vec() }).unwrap();
+        write_snapshot(
+            &d,
+            &Snapshot {
+                index: 8,
+                term: 1,
+                data: b"machine".to_vec(),
+            },
+        )
+        .unwrap();
         drop(w);
 
         let (_, l) = Wal::open(&d).unwrap();
@@ -354,6 +381,9 @@ mod tests {
         assert_eq!(l.entries.len(), 3);
         assert_eq!(l.entries[2], (3, b"eleven".to_vec()));
         let s = l.snapshot.unwrap();
-        assert_eq!((s.index, s.term, s.data.as_slice()), (8, 1, &b"machine"[..]));
+        assert_eq!(
+            (s.index, s.term, s.data.as_slice()),
+            (8, 1, &b"machine"[..])
+        );
     }
 }

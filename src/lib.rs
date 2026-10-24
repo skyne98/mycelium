@@ -152,7 +152,13 @@ impl Remote {
         for k in 0..self.targets.len() {
             let i = (start + k) % self.targets.len();
             let (addr, name) = &self.targets[i];
-            let dial = async { Ok::<_, Error>(self.endpoint.connect_with(self.cfg.clone(), *addr, name)?.await?) };
+            let dial = async {
+                Ok::<_, Error>(
+                    self.endpoint
+                        .connect_with(self.cfg.clone(), *addr, name)?
+                        .await?,
+                )
+            };
             // Long enough for a handshake on a loaded machine, short enough to
             // move on from a dead node quickly.
             match tokio::time::timeout(Duration::from_secs(5), dial).await {
@@ -173,7 +179,8 @@ impl Remote {
         let mut slot = self.conn.lock().await;
         if slot.as_ref().is_some_and(|(j, _)| *j == i) {
             *slot = None;
-            self.at.store((i + 1) % self.targets.len(), Ordering::Relaxed);
+            self.at
+                .store((i + 1) % self.targets.len(), Ordering::Relaxed);
         }
     }
 
@@ -294,8 +301,14 @@ impl Remote {
         rx
     }
 
-    fn follow(self: Arc<Self>, name: String, from: u64, ephemeral: bool) -> mpsc::Receiver<(u64, Bytes)> {
-        let req = move |n: &str, at: u64| parts(&[n.as_bytes(), &at.to_be_bytes(), &[ephemeral as u8]]);
+    fn follow(
+        self: Arc<Self>,
+        name: String,
+        from: u64,
+        ephemeral: bool,
+    ) -> mpsc::Receiver<(u64, Bytes)> {
+        let req =
+            move |n: &str, at: u64| parts(&[n.as_bytes(), &at.to_be_bytes(), &[ephemeral as u8]]);
         let first = req(&name, from);
         self.subscribe(
             node::FOLLOW,
@@ -310,13 +323,18 @@ impl Remote {
 
     fn map_watch(self: Arc<Self>, name: String) -> mpsc::Receiver<(String, Option<Vec<u8>>)> {
         let req = parts(&[name.as_bytes()]);
-        self.subscribe(node::MAP_WATCH, req, |_| None, |frame| {
-            let mut b = Blobs::new(frame);
-            let key = b.text().ok()?;
-            let present = b.take().ok()? == [1];
-            let v = b.take().ok()?.to_vec();
-            Some((key, present.then_some(v)))
-        })
+        self.subscribe(
+            node::MAP_WATCH,
+            req,
+            |_| None,
+            |frame| {
+                let mut b = Blobs::new(frame);
+                let key = b.text().ok()?;
+                let present = b.take().ok()? == [1];
+                let v = b.take().ok()?.to_vec();
+                Some((key, present.then_some(v)))
+            },
+        )
     }
 }
 
@@ -327,7 +345,13 @@ enum Backend {
 }
 
 impl Backend {
-    async fn append(&self, ephemeral: bool, body: Vec<u8>, name: &str, payloads: &[&[u8]]) -> Result<u64> {
+    async fn append(
+        &self,
+        ephemeral: bool,
+        body: Vec<u8>,
+        name: &str,
+        payloads: &[&[u8]],
+    ) -> Result<u64> {
         match self {
             Backend::Local(s) if ephemeral => Ok(s.append_ephemeral(
                 name,
@@ -351,16 +375,19 @@ impl Backend {
         match self {
             Backend::Local(s) if ephemeral => Ok(s.ephemeral_len(name)),
             Backend::Local(s) => s.len(name).await,
-            Backend::Remote(r) => {
-                node::index(&r.call(node::LEN, parts(&[name.as_bytes(), &[ephemeral as u8]])).await?)
-            }
+            Backend::Remote(r) => node::index(
+                &r.call(node::LEN, parts(&[name.as_bytes(), &[ephemeral as u8]]))
+                    .await?,
+            ),
         }
     }
 
     async fn first(&self, name: &str) -> Result<u64> {
         match self {
             Backend::Local(s) => s.first(name).await,
-            Backend::Remote(r) => node::index(&r.call(node::FIRST, parts(&[name.as_bytes()])).await?),
+            Backend::Remote(r) => {
+                node::index(&r.call(node::FIRST, parts(&[name.as_bytes()])).await?)
+            }
         }
     }
 
@@ -374,7 +401,12 @@ impl Backend {
         }
     }
 
-    async fn follow(&self, name: &str, from: u64, ephemeral: bool) -> Result<mpsc::Receiver<(u64, Bytes)>> {
+    async fn follow(
+        &self,
+        name: &str,
+        from: u64,
+        ephemeral: bool,
+    ) -> Result<mpsc::Receiver<(u64, Bytes)>> {
         match self {
             Backend::Local(s) if ephemeral => Ok(s.follow_ephemeral(name.to_string(), from)),
             Backend::Local(s) => Ok(s.follow(name.to_string(), from)),
@@ -389,7 +421,10 @@ impl Backend {
         match self {
             Backend::Local(s) => s.map_set(name, key, val).await,
             Backend::Remote(r) => r
-                .call(node::MAP_SET, parts(&[name.as_bytes(), key.as_bytes(), &val]))
+                .call(
+                    node::MAP_SET,
+                    parts(&[name.as_bytes(), key.as_bytes(), &val]),
+                )
                 .await
                 .map(drop),
         }
@@ -409,7 +444,9 @@ impl Backend {
         match self {
             Backend::Local(s) => Ok(s.map_get(name, key)),
             Backend::Remote(r) => {
-                let out = r.call(node::MAP_GET, parts(&[name.as_bytes(), key.as_bytes()])).await?;
+                let out = r
+                    .call(node::MAP_GET, parts(&[name.as_bytes(), key.as_bytes()]))
+                    .await?;
                 Ok(match out.split_first() {
                     Some((1, v)) => Some(v.to_vec()),
                     _ => None,
@@ -529,7 +566,10 @@ impl<T> Stream<T> {
     async fn push(&self, payloads: &[&[u8]]) -> Result<u64> {
         let seq = self.db.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let body = raft::append_body(&self.name, self.db.client, seq, self.retention, payloads);
-        self.db.backend.append(self.ephemeral, body, &self.name, payloads).await
+        self.db
+            .backend
+            .append(self.ephemeral, body, &self.name, payloads)
+            .await
     }
 
     pub async fn append_raw(&self, bytes: &[u8]) -> Result<u64> {
@@ -539,7 +579,11 @@ impl<T> Stream<T> {
     }
 
     pub async fn watch_raw(&self, from: u64) -> Result<mpsc::Receiver<(u64, Raw)>> {
-        let mut raw = self.db.backend.follow(&self.name, from, self.ephemeral).await?;
+        let mut raw = self
+            .db
+            .backend
+            .follow(&self.name, from, self.ephemeral)
+            .await?;
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(async move {
             while let Some((idx, bytes)) = raw.recv().await {
@@ -580,7 +624,11 @@ impl<T: Serialize + DeserializeOwned> Stream<T> {
     where
         T: Send + 'static,
     {
-        let mut raw = self.db.backend.follow(&self.name, from, self.ephemeral).await?;
+        let mut raw = self
+            .db
+            .backend
+            .follow(&self.name, from, self.ephemeral)
+            .await?;
         let (tx, rx) = mpsc::channel(256);
         let (fp, skipped) = (self.fp, self.skipped.clone());
         tokio::spawn(async move {
@@ -619,11 +667,17 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Map<K, V>
     /// and by pull within a second, even after a partition heals.
     pub async fn set(&self, key: &K, value: &V) -> Result<()> {
         let v = encode(fingerprint::<V>(), value)?;
-        self.db.backend.map_set(&self.name, &key_text(key)?, v).await
+        self.db
+            .backend
+            .map_set(&self.name, &key_text(key)?, v)
+            .await
     }
 
     pub async fn remove(&self, key: &K) -> Result<()> {
-        self.db.backend.map_remove(&self.name, &key_text(key)?).await
+        self.db
+            .backend
+            .map_remove(&self.name, &key_text(key)?)
+            .await
     }
 
     /// This replica's view. None also when the value was written as another type.
@@ -738,7 +792,13 @@ impl Mycelium {
 
     /// The cluster's members, as the node you talk to sees them.
     pub async fn members(&self) -> Result<Vec<Member>> {
-        Ok(self.backend.members().await?.into_iter().map(Member::from).collect())
+        Ok(self
+            .backend
+            .members()
+            .await?
+            .into_iter()
+            .map(Member::from)
+            .collect())
     }
 }
 
@@ -907,10 +967,16 @@ impl Node {
             )
             .into());
         }
-        let others: Vec<&Peer> = self.peers.iter().chain(self.join.iter().flatten()).collect();
+        let others: Vec<&Peer> = self
+            .peers
+            .iter()
+            .chain(self.join.iter().flatten())
+            .collect();
         if self.tls.is_some() {
             if let Some(p) = others.iter().find(|p| p.name.is_none()) {
-                return Err(format!("peer {} needs a certificate name (Peer::verified)", p.addr).into());
+                return Err(
+                    format!("peer {} needs a certificate name (Peer::verified)", p.addr).into(),
+                );
             }
             return Ok(());
         }
@@ -924,7 +990,10 @@ impl Node {
             )
             .into());
         }
-        if let Some(p) = others.iter().find(|p| p.name.is_some() || !p.addr.ip().is_loopback()) {
+        if let Some(p) = others
+            .iter()
+            .find(|p| p.name.is_some() || !p.addr.ip().is_loopback())
+        {
             return Err(format!("peer {} needs Node::with_tls on this node too", p.addr).into());
         }
         Ok(())
@@ -1005,7 +1074,8 @@ fn tailnet_peer(p: &serde_json::Value, port: u16) -> Option<Peer> {
 /// This machine on the tailnet: its address on `port`, and the name its
 /// `tailscale cert` certificate carries.
 pub fn tailnet_self(port: u16) -> Result<Peer> {
-    tailnet_peer(&tailscale_status()?["Self"], port).ok_or_else(|| "tailscale reports no address for this machine".into())
+    tailnet_peer(&tailscale_status()?["Self"], port)
+        .ok_or_else(|| "tailscale reports no address for this machine".into())
 }
 
 /// Every online machine on this tailnet, as a verified peer on `port`. Feed
@@ -1043,7 +1113,11 @@ impl Running {
 
     /// The membership this node has.
     pub fn members(&self) -> Vec<Member> {
-        self.shared.members().into_iter().map(Member::from).collect()
+        self.shared
+            .members()
+            .into_iter()
+            .map(Member::from)
+            .collect()
     }
 
     /// Add a node to the cluster: it catches up as a learner, then votes.

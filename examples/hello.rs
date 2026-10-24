@@ -79,7 +79,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             configured(Node::cluster(me.addr, peers)).serve().await?
         }
         Some("join") => {
-            let specs = if args.len() > 2 { args[2..].to_vec() } else { vec!["127.0.0.1:7777".into()] };
+            let specs = if args.len() > 2 {
+                args[2..].to_vec()
+            } else {
+                vec!["127.0.0.1:7777".into()]
+            };
             run(Client::any(specs.iter().map(|s| peer(s))).connect().await?).await?
         }
         _ => run(Mycelium::local()).await?,

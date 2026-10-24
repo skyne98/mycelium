@@ -6,7 +6,8 @@
 
 use crate::maps::Maps;
 use crate::raft::{
-    self, AppendReq, AppendResp, Core, Machine, Member, Outbound, Role, SnapChunk, VoteReq, VoteResp,
+    self, AppendReq, AppendResp, Core, Machine, Member, Outbound, Role, SnapChunk, VoteReq,
+    VoteResp,
 };
 use crate::transport::{self, parts, Blobs, Identity};
 use crate::wal::{self, Snapshot, Wal};
@@ -136,7 +137,9 @@ pub(crate) fn reply(out: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn index(out: &[u8]) -> Result<u64> {
-    Ok(u64::from_be_bytes(out.try_into().map_err(|_| "malformed index")?))
+    Ok(u64::from_be_bytes(
+        out.try_into().map_err(|_| "malformed index")?,
+    ))
 }
 
 fn member(p: &Peer, voter: bool) -> Member {
@@ -161,9 +164,15 @@ pub(crate) fn start(cfg: Config) -> Result<Arc<Shared>> {
         None => transport::server_endpoint_local(cfg.bind)?,
     };
     let solo = cfg.peers.is_empty() && cfg.join.is_none();
-    let me = if solo { endpoint.local_addr()? } else { cfg.bind };
+    let me = if solo {
+        endpoint.local_addr()?
+    } else {
+        cfg.bind
+    };
     let my_name = cfg.identity.as_ref().and_then(|i| i.name());
-    let dir = cfg.dir.join(me.to_string().replace([':', '.', '[', ']'], "_"));
+    let dir = cfg
+        .dir
+        .join(me.to_string().replace([':', '.', '[', ']'], "_"));
     let (wal, loaded) = Wal::open(&dir.join("raft"))?;
     let maps = Maps::open(dir.join("maps"))?;
     let bootstrap = if cfg.join.is_some() {
@@ -179,7 +188,14 @@ pub(crate) fn start(cfg: Config) -> Result<Arc<Shared>> {
     };
     let mut core = Core::new(me, bootstrap, Some(wal), loaded, Instant::now())?;
     core.snapshot_every = cfg.snapshot_every;
-    let s = Shared::new(me, core, maps, Some(endpoint.clone()), cfg.identity, cfg.allow);
+    let s = Shared::new(
+        me,
+        core,
+        maps,
+        Some(endpoint.clone()),
+        cfg.identity,
+        cfg.allow,
+    );
     for p in cfg.peers.iter().chain(cfg.join.iter().flatten()) {
         s.link_for(p)?;
     }
@@ -235,7 +251,8 @@ impl Shared {
             name: None,
             voter: true,
         }];
-        let core = Core::new(me, solo, None, Default::default(), Instant::now()).expect("an empty core");
+        let core =
+            Core::new(me, solo, None, Default::default(), Instant::now()).expect("an empty core");
         let s = Self::new(me, core, Maps::memory(), None, None, None);
         tokio::spawn(s.clone().elections());
         tokio::spawn(s.clone().snapshots());
@@ -289,7 +306,11 @@ impl Shared {
             c.stop("node shut down".into());
             c.release_disk();
         }
-        let ep = self.endpoint.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let ep = self
+            .endpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(ep) = ep {
             ep.close(0u32.into(), b"shutdown");
         }
@@ -303,11 +324,20 @@ impl Shared {
     // -------------------------------------------------------------- links
 
     fn all_links(&self) -> Vec<Arc<Link>> {
-        self.links.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+        self.links
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     fn link(&self, addr: SocketAddr) -> Option<Arc<Link>> {
-        self.links.lock().unwrap_or_else(|e| e.into_inner()).get(&addr).cloned()
+        self.links
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&addr)
+            .cloned()
     }
 
     fn link_for(&self, p: &Peer) -> Result<Arc<Link>> {
@@ -421,10 +451,12 @@ impl Shared {
                 }
                 Err(Some(leader)) => match &forward {
                     None => return Err("not the leader".into()),
-                    Some((role, body)) => match self.call_peer(leader, *role, body.clone(), DEADLINE).await {
-                        Ok(out) => return index(&out),
-                        Err(e) => why = e.to_string(),
-                    },
+                    Some((role, body)) => {
+                        match self.call_peer(leader, *role, body.clone(), DEADLINE).await {
+                            Ok(out) => return index(&out),
+                            Err(e) => why = e.to_string(),
+                        }
+                    }
                 },
                 Err(None) => {}
             }
@@ -446,7 +478,13 @@ impl Shared {
             .map(drop)
     }
 
-    async fn call_peer(&self, addr: SocketAddr, role: u8, body: Vec<u8>, timeout: Duration) -> Result<Vec<u8>> {
+    async fn call_peer(
+        &self,
+        addr: SocketAddr,
+        role: u8,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
         let link = self.link(addr).ok_or("the leader is not a known member")?;
         self.rpc(&link, role, body, timeout).await
     }
@@ -537,7 +575,12 @@ impl Shared {
 
     /// Committed entries of `name` from `next`, waiting when caught up.
     /// Returns where the batch starts: later than `next` if entries were trimmed.
-    async fn batch(&self, name: &str, next: u64, rx: &mut watch::Receiver<u64>) -> Option<(u64, Vec<Bytes>)> {
+    async fn batch(
+        &self,
+        name: &str,
+        next: u64,
+        rx: &mut watch::Receiver<u64>,
+    ) -> Option<(u64, Vec<Bytes>)> {
         loop {
             let (start, b) = self.core().machine.since(name, next, FOLLOW_BATCH);
             if !b.is_empty() {
@@ -591,7 +634,9 @@ impl Shared {
                 b = self.batch(&name, next, &mut rx) => b,
                 _ = &mut gone => None,
             };
-            let Some((start, batch)) = batch else { return Ok(()) };
+            let Some((start, batch)) = batch else {
+                return Ok(());
+            };
             next = start;
             for e in batch {
                 transport::put(send, &parts(&[&next.to_be_bytes(), &e])).await?;
@@ -629,14 +674,23 @@ impl Shared {
         match e.streams.get(name) {
             Some((base, q)) => {
                 let start = from.max(*base);
-                let out = q.iter().skip((start - base) as usize).take(FOLLOW_BATCH).cloned().collect();
+                let out = q
+                    .iter()
+                    .skip((start - base) as usize)
+                    .take(FOLLOW_BATCH)
+                    .cloned()
+                    .collect();
                 (start, out)
             }
             None => (from, Vec::new()),
         }
     }
 
-    pub fn follow_ephemeral(self: &Arc<Self>, name: String, from: u64) -> mpsc::Receiver<(u64, Bytes)> {
+    pub fn follow_ephemeral(
+        self: &Arc<Self>,
+        name: String,
+        from: u64,
+    ) -> mpsc::Receiver<(u64, Bytes)> {
         let (tx, out) = mpsc::channel(FOLLOW_BATCH);
         let s = self.clone();
         tokio::spawn(async move {
@@ -667,13 +721,17 @@ impl Shared {
 
     pub async fn map_set(self: &Arc<Self>, name: &str, key: &str, val: Vec<u8>) -> Result<()> {
         let update = self.maps.set(name, key, val)?;
-        let _ = self.map_tx.send((name.to_string(), key.as_bytes().to_vec()));
+        let _ = self
+            .map_tx
+            .send((name.to_string(), key.as_bytes().to_vec()));
         self.share(name, update).await
     }
 
     pub async fn map_remove(self: &Arc<Self>, name: &str, key: &str) -> Result<()> {
         let update = self.maps.remove(name, key)?;
-        let _ = self.map_tx.send((name.to_string(), key.as_bytes().to_vec()));
+        let _ = self
+            .map_tx
+            .send((name.to_string(), key.as_bytes().to_vec()));
         self.share(name, update).await
     }
 
@@ -766,7 +824,10 @@ impl Shared {
                 _ = tokio::time::sleep(PULL_EVERY) => {}
             }
             for l in self.all_links() {
-                if let Ok(missing) = self.rpc(&l, MAP_PULL, self.maps.versions(), RPC_TIMEOUT).await {
+                if let Ok(missing) = self
+                    .rpc(&l, MAP_PULL, self.maps.versions(), RPC_TIMEOUT)
+                    .await
+                {
                     for (name, keys) in self.maps.import_all(&missing).unwrap_or_default() {
                         for k in keys {
                             let _ = self.map_tx.send((name.clone(), k.into_bytes()));
@@ -822,7 +883,10 @@ impl Shared {
     }
 
     /// Commit a membership change, one server at a time.
-    async fn change(self: &Arc<Self>, edit: impl Fn(&[Member]) -> Option<Vec<Member>>) -> Result<()> {
+    async fn change(
+        self: &Arc<Self>,
+        edit: impl Fn(&[Member]) -> Option<Vec<Member>>,
+    ) -> Result<()> {
         let deadline = Instant::now() + DEADLINE;
         let mut rx = self.changed.subscribe();
         loop {
@@ -857,7 +921,10 @@ impl Shared {
     /// promotion to voter follow (thesis 4.2.1), so a slow joiner never
     /// stalls commits. `wait`: return only once it votes.
     async fn admit(self: &Arc<Self>, m: Member, wait: bool) -> Result<()> {
-        let learner = Member { voter: false, ..m.clone() };
+        let learner = Member {
+            voter: false,
+            ..m.clone()
+        };
         self.change(|c| {
             if c.iter().any(|x| x.addr == m.addr) {
                 return None;
@@ -922,7 +989,9 @@ impl Shared {
             return self.admit(m, true).await;
         }
         let leader = self.core().leader.ok_or("no leader")?;
-        self.call_peer(leader, JOIN, encode_members(&[m]), DEADLINE).await.map(drop)
+        self.call_peer(leader, JOIN, encode_members(&[m]), DEADLINE)
+            .await
+            .map(drop)
     }
 
     /// Leadership transfer (thesis 3.10): bring the best voter up to date,
@@ -945,7 +1014,12 @@ impl Shared {
         let term = self.core().term;
         trace!("{} hands leadership to {target}", self.me);
         let _ = self
-            .call_peer(target, TIMEOUT_NOW, parts(&[&term.to_be_bytes(), self.me.to_string().as_bytes()]), RPC_TIMEOUT)
+            .call_peer(
+                target,
+                TIMEOUT_NOW,
+                parts(&[&term.to_be_bytes(), self.me.to_string().as_bytes()]),
+                RPC_TIMEOUT,
+            )
             .await;
         while self.is_leader() {
             if self.wait(&mut rx, deadline).await.is_err() {
@@ -1033,7 +1107,13 @@ impl Shared {
     async fn poll(self: &Arc<Self>, pre: bool, force: bool) -> bool {
         let (req, quorum, term, voters, me_votes) = {
             let c = self.core();
-            (c.vote_req(pre, force), c.quorum(), c.term, c.other_voters(), c.is_voter(self.me))
+            (
+                c.vote_req(pre, force),
+                c.quorum(),
+                c.term,
+                c.other_voters(),
+                c.is_voter(self.me),
+            )
         };
         let mut granted = me_votes as usize;
         if granted >= quorum {
@@ -1047,7 +1127,11 @@ impl Shared {
             set.spawn(async move { s.rpc(&l, VOTE, body, RPC_TIMEOUT).await });
         }
         while let Some(r) = set.join_next().await {
-            let Some(resp) = r.ok().and_then(Result::ok).and_then(|o| VoteResp::decode(&o).ok()) else {
+            let Some(resp) = r
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|o| VoteResp::decode(&o).ok())
+            else {
                 continue;
             };
             if resp.granted {
@@ -1092,12 +1176,17 @@ impl Shared {
                 }
                 Some(Outbound::Append(req)) => {
                     let sent_at = Instant::now();
-                    let timeout = if req.entries.is_empty() { RPC_TIMEOUT } else { 2 * RPC_TIMEOUT };
+                    let timeout = if req.entries.is_empty() {
+                        RPC_TIMEOUT
+                    } else {
+                        2 * RPC_TIMEOUT
+                    };
                     if let Ok(out) = self.rpc(&link, APPEND_ENTRIES, req.encode(), timeout).await {
                         if let Ok(resp) = AppendResp::decode(&out) {
                             let moved = {
                                 let mut c = self.core();
-                                let moved = c.on_append_resp(peer, &req, resp, sent_at, Instant::now());
+                                let moved =
+                                    c.on_append_resp(peer, &req, resp, sent_at, Instant::now());
                                 if moved {
                                     c.apply();
                                 }
@@ -1129,7 +1218,11 @@ impl Shared {
             }
         }
         // Membership may have changed with this commit or this append.
-        if self.linked_version.swap(version, std::sync::atomic::Ordering::Relaxed) != version {
+        if self
+            .linked_version
+            .swap(version, std::sync::atomic::Ordering::Relaxed)
+            != version
+        {
             self.sync_links();
         }
     }
@@ -1141,7 +1234,12 @@ impl Shared {
             (c.snapshot.clone(), c.term)
         };
         let Some(snap) = snap else { return false };
-        trace!("{} sends snapshot {} to {}", self.me, snap.index, link.peer.addr);
+        trace!(
+            "{} sends snapshot {} to {}",
+            self.me,
+            snap.index,
+            link.peer.addr
+        );
         let sent_at = Instant::now();
         let total = snap.data.len() as u64;
         let mut offset = 0u64;
@@ -1156,14 +1254,26 @@ impl Shared {
                 total,
                 data: Bytes::copy_from_slice(&snap.data[offset as usize..end]),
             };
-            let Ok(out) = self.rpc(link, SNAPSHOT_CHUNK, chunk.encode(), 4 * RPC_TIMEOUT).await else {
+            let Ok(out) = self
+                .rpc(link, SNAPSHOT_CHUNK, chunk.encode(), 4 * RPC_TIMEOUT)
+                .await
+            else {
                 return false;
             };
-            let Ok(resp) = AppendResp::decode(&out) else { return false };
+            let Ok(resp) = AppendResp::decode(&out) else {
+                return false;
+            };
             if !resp.ok || resp.term > term || end == snap.data.len() {
                 let moved = {
                     let mut c = self.core();
-                    let m = c.on_snapshot_resp(link.peer.addr, term, snap.index, resp, sent_at, Instant::now());
+                    let m = c.on_snapshot_resp(
+                        link.peer.addr,
+                        term,
+                        snap.index,
+                        resp,
+                        sent_at,
+                        Instant::now(),
+                    );
                     if m {
                         c.apply();
                     }
@@ -1177,13 +1287,23 @@ impl Shared {
     }
 
     async fn receive_snapshot(self: &Arc<Self>, chunk: SnapChunk) -> Result<AppendResp> {
-        if let Err(term) = self.core().handle_snapshot_chunk(chunk.term, chunk.leader, Instant::now()) {
-            return Ok(AppendResp { term, ok: false, index: 0 });
+        if let Err(term) =
+            self.core()
+                .handle_snapshot_chunk(chunk.term, chunk.leader, Instant::now())
+        {
+            return Ok(AppendResp {
+                term,
+                ok: false,
+                index: 0,
+            });
         }
         let complete = {
             let mut slot = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
             if chunk.offset == 0 {
-                *slot = Some((chunk.index, Vec::with_capacity(chunk.total.min(1 << 30) as usize)));
+                *slot = Some((
+                    chunk.index,
+                    Vec::with_capacity(chunk.total.min(1 << 30) as usize),
+                ));
             }
             match slot.as_mut() {
                 Some((idx, buf)) if *idx == chunk.index && buf.len() as u64 == chunk.offset => {
@@ -1199,7 +1319,11 @@ impl Shared {
         };
         let term = self.core().term;
         let Some(data) = complete else {
-            return Ok(AppendResp { term, ok: true, index: 0 });
+            return Ok(AppendResp {
+                term,
+                ok: true,
+                index: 0,
+            });
         };
         let machine = Machine::decode(&data)?;
         let snap = Arc::new(Snapshot {
@@ -1262,7 +1386,9 @@ impl Shared {
                 _ = stop.changed() => return,
                 r = rx.changed() => if r.is_err() { return },
             }
-            let Some(job) = self.core().snapshot_job() else { continue };
+            let Some(job) = self.core().snapshot_job() else {
+                continue;
+            };
             let dir = self.core().snapshot_dir();
             let written = tokio::task::spawn_blocking(move || {
                 let snap = job.encode();
@@ -1353,7 +1479,13 @@ impl Shared {
     /// One request on its own stream. Dialing gets at most RPC_TIMEOUT, so a
     /// dead peer costs that, not a QUIC handshake timeout and not the whole
     /// request budget; the request itself gets the rest of `timeout`.
-    async fn rpc(&self, link: &Link, role: u8, body: Vec<u8>, timeout: Duration) -> Result<Vec<u8>> {
+    async fn rpc(
+        &self,
+        link: &Link,
+        role: u8,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
         let call = async {
             let conn = match tokio::time::timeout(RPC_TIMEOUT.min(timeout), self.conn(link)).await {
                 Ok(c) => c?,
@@ -1396,7 +1528,11 @@ impl Shared {
         };
         let covered: Vec<SocketAddr> = known
             .iter()
-            .filter(|m| m.name.as_ref().is_some_and(|n| names.iter().any(|x| x.eq_ignore_ascii_case(n))))
+            .filter(|m| {
+                m.name
+                    .as_ref()
+                    .is_some_and(|n| names.iter().any(|x| x.eq_ignore_ascii_case(n)))
+            })
             .map(|m| m.addr)
             .collect();
         if covered.is_empty() {
@@ -1407,7 +1543,9 @@ impl Shared {
     }
 
     fn allowed(&self, caller: &Caller) -> bool {
-        let Some(allow) = &self.allow else { return true };
+        let Some(allow) = &self.allow else {
+            return true;
+        };
         match caller {
             Caller::Peer(_) => true,
             Caller::Client(None) => false,
@@ -1466,7 +1604,12 @@ impl Shared {
         Ok(())
     }
 
-    async fn dispatch(self: &Arc<Self>, caller: Caller, role: u8, body: Vec<u8>) -> Result<Vec<u8>> {
+    async fn dispatch(
+        self: &Arc<Self>,
+        caller: Caller,
+        role: u8,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>> {
         let mut b = Blobs::new(&body);
         match role {
             APPEND => {
@@ -1479,13 +1622,24 @@ impl Shared {
                     while !r.is_empty() {
                         payloads.push(Bytes::copy_from_slice(r.take()?));
                     }
-                    return Ok(self.append_ephemeral(&name, payloads).to_be_bytes().to_vec());
+                    return Ok(self
+                        .append_ephemeral(&name, payloads)
+                        .to_be_bytes()
+                        .to_vec());
                 }
-                return Ok(self.append(rest.to_vec(), true).await?.to_be_bytes().to_vec());
+                return Ok(self
+                    .append(rest.to_vec(), true)
+                    .await?
+                    .to_be_bytes()
+                    .to_vec());
             }
             LEN => {
                 let (name, ephemeral) = (b.text()?, b.take()? == [1]);
-                let n = if ephemeral { self.ephemeral_len(&name) } else { self.len(&name).await? };
+                let n = if ephemeral {
+                    self.ephemeral_len(&name)
+                } else {
+                    self.len(&name).await?
+                };
                 return Ok(n.to_be_bytes().to_vec());
             }
             FIRST => return Ok(self.first(&b.text()?).await?.to_be_bytes().to_vec()),
@@ -1513,7 +1667,10 @@ impl Shared {
             }
             MAP_ENTRIES => {
                 let e = self.maps.entries(&b.text()?);
-                let pieces: Vec<&[u8]> = e.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_slice()]).collect();
+                let pieces: Vec<&[u8]> = e
+                    .iter()
+                    .flat_map(|(k, v)| [k.as_bytes(), v.as_slice()])
+                    .collect();
                 return Ok(parts(&pieces));
             }
             MEMBERS => return Ok(encode_members(&self.members())),
@@ -1570,7 +1727,11 @@ impl Shared {
             FORWARD => Ok(self.append(body, false).await?.to_be_bytes().to_vec()),
             PROPOSE => {
                 let (_, name, before) = (b.take()?, b.text()?, b.u64()?);
-                Ok(self.commit(raft::trim_command(&name, before), None).await?.to_be_bytes().to_vec())
+                Ok(self
+                    .commit(raft::trim_command(&name, before), None)
+                    .await?
+                    .to_be_bytes()
+                    .to_vec())
             }
             READ_INDEX => {
                 let idx = self.read_index(false, Instant::now() + RPC_TIMEOUT).await?;
@@ -1594,9 +1755,15 @@ impl Shared {
     /// Joins arrive from nodes that are not members yet, so they are checked
     /// against the certificate, not the membership.
     async fn handle_join(self: &Arc<Self>, conn_names: &[String], body: &[u8]) -> Result<Vec<u8>> {
-        let m = decode_members(body)?.into_iter().next().ok_or("empty join")?;
+        let m = decode_members(body)?
+            .into_iter()
+            .next()
+            .ok_or("empty join")?;
         if self.secure {
-            let name = m.name.as_deref().ok_or("a joining node needs a certificate name")?;
+            let name = m
+                .name
+                .as_deref()
+                .ok_or("a joining node needs a certificate name")?;
             if !conn_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
                 return Err("join does not match the caller's certificate".into());
             }
@@ -1608,7 +1775,10 @@ impl Shared {
             let leader = self.core().leader.ok_or("no leader")?;
             return self.call_peer(leader, JOIN, body.to_vec(), DEADLINE).await;
         }
-        self.link_for(&Peer { addr: m.addr, name: m.name.clone() })?;
+        self.link_for(&Peer {
+            addr: m.addr,
+            name: m.name.clone(),
+        })?;
         self.admit(m, false).await?;
         Ok(encode_members(&self.members()))
     }

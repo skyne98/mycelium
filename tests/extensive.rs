@@ -1249,10 +1249,13 @@ async fn misconfigured_nodes_refuse_to_start() {
     );
 }
 
-
 // ------------------------------------------------- the features added last
 
-async fn start_cluster_with(addrs: &[SocketAddr], dir: &std::path::Path, every: u64) -> Vec<mycelium::Running> {
+async fn start_cluster_with(
+    addrs: &[SocketAddr],
+    dir: &std::path::Path,
+    every: u64,
+) -> Vec<mycelium::Running> {
     let mut nodes = Vec::new();
     for i in 0..addrs.len() {
         let peers: Vec<Peer> = addrs
@@ -1295,7 +1298,10 @@ async fn a_client_fails_over_to_another_node() {
     let dir = fresh_dir("client-failover");
     let nodes = start_cluster_with(&addrs, &dir, 10_000).await;
     leader_of(&nodes).await;
-    let client = mycelium::Client::any(addrs.iter().map(|a| Peer::local(*a))).connect().await.unwrap();
+    let client = mycelium::Client::any(addrs.iter().map(|a| Peer::local(*a)))
+        .connect()
+        .await
+        .unwrap();
     let s = client.stream::<u64>("fo");
     assert_eq!(append_when_ready(&s, &0).await, 0);
     let mut rx = s.watch(0).await.unwrap();
@@ -1304,10 +1310,17 @@ async fn a_client_fails_over_to_another_node() {
     // The client talks to addrs[0] first. Take that node away.
     nodes[0].shutdown();
     for i in 1..6u64 {
-        assert_eq!(s.append(&i).await.unwrap(), i, "the client moved to a live node");
+        assert_eq!(
+            s.append(&i).await.unwrap(),
+            i,
+            "the client moved to a live node"
+        );
     }
     for i in 1..6u64 {
-        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.ok().flatten();
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .ok()
+            .flatten();
         assert_eq!(got, Some((i, i)), "the watch moved too, without gaps");
     }
     assert_eq!(s.len().await.unwrap(), 6);
@@ -1317,7 +1330,11 @@ async fn a_client_fails_over_to_another_node() {
 async fn compaction_keeps_restarts_and_laggards_whole() {
     let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
     let dir = fresh_dir("compact");
-    let mut nodes: Vec<Option<mycelium::Running>> = start_cluster_with(&addrs, &dir, 20).await.into_iter().map(Some).collect();
+    let mut nodes: Vec<Option<mycelium::Running>> = start_cluster_with(&addrs, &dir, 20)
+        .await
+        .into_iter()
+        .map(Some)
+        .collect();
     let l = {
         let live: Vec<mycelium::Running> = Vec::new();
         drop(live);
@@ -1346,10 +1363,24 @@ async fn compaction_keeps_restarts_and_laggards_whole() {
             s.append(&(1000 + chunk * 5 + i)).await.unwrap();
         }
     }
-    let log = |i: usize| std::fs::metadata(dir.join(addrs[i].to_string().replace([':', '.'], "_")).join("raft/log")).unwrap().len();
-    let snap = |i: usize| dir.join(addrs[i].to_string().replace([':', '.'], "_")).join("raft/snapshot");
+    let log = |i: usize| {
+        std::fs::metadata(
+            dir.join(addrs[i].to_string().replace([':', '.'], "_"))
+                .join("raft/log"),
+        )
+        .unwrap()
+        .len()
+    };
+    let snap = |i: usize| {
+        dir.join(addrs[i].to_string().replace([':', '.'], "_"))
+            .join("raft/snapshot")
+    };
     eventually("the leader wrote a snapshot", || async { snap(l).exists() }).await;
-    assert!(log(l) < 4096, "the leader's log was compacted to {} bytes", log(l));
+    assert!(
+        log(l) < 4096,
+        "the leader's log was compacted to {} bytes",
+        log(l)
+    );
 
     // The lagging node is now behind the leader's snapshot: it gets one.
     nodes[lagger] = Some(start_node(&addrs, lagger, &dir).await);
@@ -1358,7 +1389,10 @@ async fn compaction_keeps_restarts_and_laggards_whole() {
         back.len().await.map(|n| n == 150).unwrap_or(false)
     })
     .await;
-    eventually("and keeps that snapshot on disk", || async { snap(lagger).exists() }).await;
+    eventually("and keeps that snapshot on disk", || async {
+        snap(lagger).exists()
+    })
+    .await;
 
     // Everyone restarts from snapshot + tail.
     for n in nodes.iter_mut() {
@@ -1415,7 +1449,10 @@ async fn nodes_join_and_leave_a_running_cluster() {
         .await
         .unwrap();
     eventually("the new node becomes a voter", || async {
-        joiner.members().iter().any(|m| m.addr == addrs[3] && m.voter)
+        joiner
+            .members()
+            .iter()
+            .any(|m| m.addr == addrs[3] && m.voter)
     })
     .await;
     assert_eq!(nodes[l].members().iter().filter(|m| m.voter).count(), 4);
@@ -1427,17 +1464,34 @@ async fn nodes_join_and_leave_a_running_cluster() {
     nodes[l].remove(addrs[gone]).await.unwrap();
     nodes[gone].shutdown();
     assert_eq!(nodes[l].members().len(), 3);
-    assert_eq!(append_when_ready(&j, &10).await, 10, "writes go through the joined node");
+    assert_eq!(
+        append_when_ready(&j, &10).await,
+        10,
+        "writes go through the joined node"
+    );
     let client = Mycelium::join(addrs[3]).await.unwrap();
-    let ms: Vec<SocketAddr> = client.members().await.unwrap().into_iter().map(|m| m.addr).collect();
-    assert!(!ms.contains(&addrs[gone]) && ms.contains(&addrs[3]), "members over the wire: {ms:?}");
+    let ms: Vec<SocketAddr> = client
+        .members()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.addr)
+        .collect();
+    assert!(
+        !ms.contains(&addrs[gone]) && ms.contains(&addrs[3]),
+        "members over the wire: {ms:?}"
+    );
 
     // Membership is in the log: it survives a restart without the old peer list.
     joiner.shutdown();
     drop(joiner);
     let mut again = None;
     for _ in 0..100 {
-        if let Ok(r) = mycelium::Node::join(addrs[3], vec![Peer::local(addrs[l])]).with_data_dir(&dir).start().await {
+        if let Ok(r) = mycelium::Node::join(addrs[3], vec![Peer::local(addrs[l])])
+            .with_data_dir(&dir)
+            .start()
+            .await
+        {
             again = Some(r);
             break;
         }
@@ -1470,7 +1524,12 @@ async fn a_graceful_stop_hands_over_leadership_quickly() {
         handed + pause < Duration::from_millis(900),
         "handover {handed:?} + first write {pause:?} must beat the 1 s election timeout"
     );
-    let survivors: Vec<&mycelium::Running> = nodes.iter().enumerate().filter(|(i, _)| *i != l).map(|(_, n)| n).collect();
+    let survivors: Vec<&mycelium::Running> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != l)
+        .map(|(_, n)| n)
+        .collect();
     let mut leaders = 0;
     for n in survivors {
         leaders += n.is_leader().await as usize;
@@ -1482,21 +1541,36 @@ async fn a_graceful_stop_hands_over_leadership_quickly() {
 async fn ephemeral_streams_are_fast_and_forgotten() {
     let addr = free_addr();
     let dir = fresh_dir("ephemeral");
-    let node = mycelium::Node::bind(addr).with_data_dir(&dir).start().await.unwrap();
+    let node = mycelium::Node::bind(addr)
+        .with_data_dir(&dir)
+        .start()
+        .await
+        .unwrap();
     let client = Mycelium::join(addr).await.unwrap();
     let pings = client.stream::<String>("presence").ephemeral();
     let mut rx = pings.watch(0).await.unwrap();
     assert_eq!(pings.append(&"a".into()).await.unwrap(), 0);
-    assert_eq!(pings.append_many(&["b".into(), "c".into()]).await.unwrap(), vec![1, 2]);
+    assert_eq!(
+        pings.append_many(&["b".into(), "c".into()]).await.unwrap(),
+        vec![1, 2]
+    );
     assert_eq!(pings.len().await.unwrap(), 3);
     for (i, v) in ["a", "b", "c"].iter().enumerate() {
         assert_eq!(recv(&mut rx).await, Some((i as u64, v.to_string())));
     }
     let durable = client.stream::<String>("presence");
-    assert_eq!(durable.len().await.unwrap(), 0, "ephemeral and durable streams are separate");
-    assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
-        std::fs::read(e.path().join("raft/log")).is_ok_and(|b| b.windows(8).any(|w| w == b"presence"))
-    }), "nothing ephemeral reaches the disk");
+    assert_eq!(
+        durable.len().await.unwrap(),
+        0,
+        "ephemeral and durable streams are separate"
+    );
+    assert!(
+        !std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+            std::fs::read(e.path().join("raft/log"))
+                .is_ok_and(|b| b.windows(8).any(|w| w == b"presence"))
+        }),
+        "nothing ephemeral reaches the disk"
+    );
 
     node.shutdown();
     drop(node);
@@ -1509,7 +1583,16 @@ async fn ephemeral_streams_are_fast_and_forgotten() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let node = node.unwrap();
-    assert_eq!(node.handle().stream::<String>("presence").ephemeral().len().await.unwrap(), 0, "gone after a restart");
+    assert_eq!(
+        node.handle()
+            .stream::<String>("presence")
+            .ephemeral()
+            .len()
+            .await
+            .unwrap(),
+        0,
+        "gone after a restart"
+    );
 }
 
 #[tokio::test]
@@ -1525,7 +1608,11 @@ async fn retention_trims_by_count_age_and_on_request() {
     assert_eq!(s.len().await.unwrap(), 10, "len is the next index");
     assert_eq!(s.first().await.unwrap(), 7);
     let mut rx = s.watch(0).await.unwrap();
-    assert_eq!(recv(&mut rx).await, Some((7, 7)), "watch starts at the first entry left");
+    assert_eq!(
+        recv(&mut rx).await,
+        Some((7, 7)),
+        "watch starts at the first entry left"
+    );
 
     let manual = node.stream::<u64>("manual");
     for i in 0..5u64 {
@@ -1546,7 +1633,11 @@ async fn retention_trims_by_count_age_and_on_request() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(aged.first().await.unwrap(), 2, "entries past max_age expire");
+    assert_eq!(
+        aged.first().await.unwrap(),
+        2,
+        "entries past max_age expire"
+    );
     aged.append(&3).await.unwrap();
     assert_eq!(aged.len().await.unwrap(), 3);
 }
@@ -1555,16 +1646,29 @@ async fn retention_trims_by_count_age_and_on_request() {
 async fn map_watch_sees_local_and_remote_changes() {
     let cluster = start_cluster(3, "map-watch").await;
     let a = cluster[0].handle().map::<String, u64>("w");
-    let b = Mycelium::join(cluster[2].addr).await.unwrap().map::<String, u64>("w");
+    let b = Mycelium::join(cluster[2].addr)
+        .await
+        .unwrap()
+        .map::<String, u64>("w");
     let mut rx = b.watch().await.unwrap();
     a.set(&"x".into(), &1).await.unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
-    assert_eq!(got, Some(("x".to_string(), Some(1))), "a remote set reaches a watcher");
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        Some(("x".to_string(), Some(1))),
+        "a remote set reaches a watcher"
+    );
     b.set(&"y".into(), &2).await.unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap();
     assert_eq!(got, Some(("y".to_string(), Some(2))), "so does a local one");
     a.remove(&"x".into()).await.unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap();
     assert_eq!(got, Some(("x".to_string(), None)), "removes arrive as None");
 }
 
@@ -1574,7 +1678,10 @@ async fn tailnet_discovery_reads_tailscale_status() {
         Ok(peers) => {
             for p in &peers {
                 assert_eq!(p.addr.port(), 7777);
-                assert!(p.name.as_deref().is_some_and(|n| n.contains('.')), "a full tailnet name: {p:?}");
+                assert!(
+                    p.name.as_deref().is_some_and(|n| n.contains('.')),
+                    "a full tailnet name: {p:?}"
+                );
             }
         }
         Err(e) => eprintln!("skipped, no tailscale here: {e}"),
