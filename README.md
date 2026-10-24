@@ -158,10 +158,15 @@ Failover across machines: killing the leader moved leadership to the laptop
 (term 2); writes continued through the laptop node, and the old leader rejoined
 and caught up. All three log files ended byte-identical (same SHA-256).
 
-With verified certificates: a third node joined a running two-node cluster
-with `hello add` and became a voter; SIGTERM on the leader handed leadership
-to it ("hands leadership to ..." / "leads term 2") and a `Client::any` kept
-writing through the change.
+Under faults, across both machines (`examples/soak.rs`): two nodes on the
+workstation, the laptop joining over TLS with `hello add`. A `Client::any`
+writes every 20 ms for 60 s while the leader gets SIGTERM (it hands
+leadership to the laptop), is restarted, and the laptop node is killed with
+`kill -9` and restarted. Result: 1070 writes acknowledged, 0 failed, slowest
+1.8 s (during the `kill -9`); every acknowledged write was in the stream at
+its index, nothing twice, and a watch through another node matched entry for
+entry. The three logs on the two machines ended byte-identical. The
+workstation was compiling other projects at load average 50 throughout.
 
 Tail latency over that WiFi link is the link, not the library. A raw UDP echo
 on the same path has a p99 of 47 to 54 ms with spikes to 99 ms; requests from
