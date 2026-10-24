@@ -30,12 +30,7 @@ async fn recv<T>(rx: &mut Receiver<T>) -> Option<T> {
 }
 
 async fn node_over_socket() -> SocketAddr {
-    let addr = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
-        a
-    };
+    let addr = free_addr();
     let dir = fresh_dir(&format!("solo-{}", addr.port()));
     tokio::spawn(async move {
         let _ = mycelium::Node::bind(addr).with_data_dir(dir).serve().await;
@@ -725,11 +720,10 @@ async fn batch_and_single_writers_interleave_correctly() {
 
 // ------------------------------------------------------------ replication
 
+/// A UDP port nobody holds right now (QUIC listens on UDP).
 fn free_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.local_addr().unwrap()
 }
 
 fn data_dir(tag: &str) -> std::path::PathBuf {
@@ -1253,4 +1247,336 @@ async fn misconfigured_nodes_refuse_to_start() {
         mycelium::Client::to(lan).connect().await.is_err(),
         "no unverified client off loopback"
     );
+}
+
+
+// ------------------------------------------------- the features added last
+
+async fn start_cluster_with(addrs: &[SocketAddr], dir: &std::path::Path, every: u64) -> Vec<mycelium::Running> {
+    let mut nodes = Vec::new();
+    for i in 0..addrs.len() {
+        let peers: Vec<Peer> = addrs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, a)| Peer::local(*a))
+            .collect();
+        let mut started = None;
+        for _ in 0..50 {
+            let node = mycelium::Node::cluster(addrs[i], peers.clone())
+                .with_data_dir(dir)
+                .snapshot_every(every);
+            match node.start().await {
+                Ok(r) => {
+                    started = Some(r);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        nodes.push(started.expect("node starts"));
+    }
+    nodes
+}
+
+async fn leader_of(nodes: &[mycelium::Running]) -> usize {
+    for _ in 0..300 {
+        if let Some(i) = leader_index(nodes).await {
+            return i;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no leader");
+}
+
+#[tokio::test]
+async fn a_client_fails_over_to_another_node() {
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    let dir = fresh_dir("client-failover");
+    let nodes = start_cluster_with(&addrs, &dir, 10_000).await;
+    leader_of(&nodes).await;
+    let client = mycelium::Client::any(addrs.iter().map(|a| Peer::local(*a))).connect().await.unwrap();
+    let s = client.stream::<u64>("fo");
+    assert_eq!(append_when_ready(&s, &0).await, 0);
+    let mut rx = s.watch(0).await.unwrap();
+    assert_eq!(recv(&mut rx).await, Some((0, 0)));
+
+    // The client talks to addrs[0] first. Take that node away.
+    nodes[0].shutdown();
+    for i in 1..6u64 {
+        assert_eq!(s.append(&i).await.unwrap(), i, "the client moved to a live node");
+    }
+    for i in 1..6u64 {
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.ok().flatten();
+        assert_eq!(got, Some((i, i)), "the watch moved too, without gaps");
+    }
+    assert_eq!(s.len().await.unwrap(), 6);
+}
+
+#[tokio::test]
+async fn compaction_keeps_restarts_and_laggards_whole() {
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    let dir = fresh_dir("compact");
+    let mut nodes: Vec<Option<mycelium::Running>> = start_cluster_with(&addrs, &dir, 20).await.into_iter().map(Some).collect();
+    let l = {
+        let live: Vec<mycelium::Running> = Vec::new();
+        drop(live);
+        let mut l = None;
+        for _ in 0..300 {
+            for (i, n) in nodes.iter().enumerate() {
+                if n.as_ref().unwrap().is_leader().await {
+                    l = Some(i);
+                }
+            }
+            if l.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        l.unwrap()
+    };
+    let lagger = (0..3).find(|i| *i != l).unwrap();
+    nodes[lagger].take().unwrap().shutdown();
+
+    let s = nodes[l].as_ref().unwrap().handle().stream::<u64>("c");
+    for chunk in 0..10u64 {
+        let batch: Vec<u64> = (chunk * 10..chunk * 10 + 10).collect();
+        append_many_when_ready(&s, &batch).await;
+        for i in 0..5u64 {
+            s.append(&(1000 + chunk * 5 + i)).await.unwrap();
+        }
+    }
+    let log = |i: usize| std::fs::metadata(dir.join(addrs[i].to_string().replace([':', '.'], "_")).join("raft/log")).unwrap().len();
+    let snap = |i: usize| dir.join(addrs[i].to_string().replace([':', '.'], "_")).join("raft/snapshot");
+    eventually("the leader wrote a snapshot", || async { snap(l).exists() }).await;
+    assert!(log(l) < 4096, "the leader's log was compacted to {} bytes", log(l));
+
+    // The lagging node is now behind the leader's snapshot: it gets one.
+    nodes[lagger] = Some(start_node(&addrs, lagger, &dir).await);
+    let back = nodes[lagger].as_ref().unwrap().handle().stream::<u64>("c");
+    eventually("the lagging node is restored by snapshot", || async {
+        back.len().await.map(|n| n == 150).unwrap_or(false)
+    })
+    .await;
+    eventually("and keeps that snapshot on disk", || async { snap(lagger).exists() }).await;
+
+    // Everyone restarts from snapshot + tail.
+    for n in nodes.iter_mut() {
+        n.take().unwrap().shutdown();
+    }
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        nodes.push(start_node(&addrs, i, &dir).await);
+    }
+    let s = nodes[0].handle().stream::<u64>("c");
+    eventually("restarted from snapshot plus tail", || async {
+        s.len().await.map(|n| n == 150).unwrap_or(false)
+    })
+    .await;
+    let mut rx = s.watch(0).await.unwrap();
+    let mut got = Vec::new();
+    while got.len() < 150 {
+        got.push(recv(&mut rx).await.expect("entry").1);
+    }
+    let mut want = Vec::new();
+    for chunk in 0..10u64 {
+        want.extend(chunk * 10..chunk * 10 + 10);
+        want.extend((0..5).map(|i| 1000 + chunk * 5 + i));
+    }
+    assert_eq!(got, want, "order and content survive compaction");
+}
+
+async fn append_many_when_ready(s: &mycelium::Stream<u64>, v: &[u64]) -> Vec<u64> {
+    let mut last = String::new();
+    for _ in 0..300 {
+        match s.append_many(v).await {
+            Ok(i) => return i,
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("batch not accepted: {last}");
+}
+
+#[tokio::test]
+async fn nodes_join_and_leave_a_running_cluster() {
+    let addrs: Vec<SocketAddr> = (0..4).map(|_| free_addr()).collect();
+    let dir = fresh_dir("membership");
+    let nodes = start_cluster_with(&addrs[..3], &dir, 10_000).await;
+    let l = leader_of(&nodes).await;
+    let s = nodes[l].handle().stream::<u64>("m");
+    for i in 0..10u64 {
+        append_when_ready(&s, &i).await;
+    }
+
+    let joiner = mycelium::Node::join(addrs[3], vec![Peer::local(addrs[0]), Peer::local(addrs[1])])
+        .with_data_dir(&dir)
+        .start()
+        .await
+        .unwrap();
+    eventually("the new node becomes a voter", || async {
+        joiner.members().iter().any(|m| m.addr == addrs[3] && m.voter)
+    })
+    .await;
+    assert_eq!(nodes[l].members().iter().filter(|m| m.voter).count(), 4);
+    let j = joiner.handle().stream::<u64>("m");
+    assert_eq!(j.len().await.unwrap(), 10, "it has the whole log");
+
+    // Remove an original follower; the other three keep committing.
+    let gone = (0..3).find(|i| *i != l).unwrap();
+    nodes[l].remove(addrs[gone]).await.unwrap();
+    nodes[gone].shutdown();
+    assert_eq!(nodes[l].members().len(), 3);
+    assert_eq!(append_when_ready(&j, &10).await, 10, "writes go through the joined node");
+    let client = Mycelium::join(addrs[3]).await.unwrap();
+    let ms: Vec<SocketAddr> = client.members().await.unwrap().into_iter().map(|m| m.addr).collect();
+    assert!(!ms.contains(&addrs[gone]) && ms.contains(&addrs[3]), "members over the wire: {ms:?}");
+
+    // Membership is in the log: it survives a restart without the old peer list.
+    joiner.shutdown();
+    drop(joiner);
+    let mut again = None;
+    for _ in 0..100 {
+        if let Ok(r) = mycelium::Node::join(addrs[3], vec![Peer::local(addrs[l])]).with_data_dir(&dir).start().await {
+            again = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let again = again.unwrap();
+    eventually("the restarted joiner still knows the cluster", || async {
+        again.members().iter().filter(|m| m.voter).count() == 3
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_graceful_stop_hands_over_leadership_quickly() {
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    let dir = fresh_dir("transfer");
+    let nodes = start_cluster_with(&addrs, &dir, 10_000).await;
+    let l = leader_of(&nodes).await;
+    let other = (0..3).find(|i| *i != l).unwrap();
+    let s = nodes[other].handle().stream::<u64>("t");
+    append_when_ready(&s, &0).await;
+
+    let started = std::time::Instant::now();
+    nodes[l].stop().await;
+    let handed = started.elapsed();
+    let t = std::time::Instant::now();
+    s.append(&1).await.unwrap();
+    let pause = t.elapsed();
+    assert!(
+        handed + pause < Duration::from_millis(900),
+        "handover {handed:?} + first write {pause:?} must beat the 1 s election timeout"
+    );
+    let survivors: Vec<&mycelium::Running> = nodes.iter().enumerate().filter(|(i, _)| *i != l).map(|(_, n)| n).collect();
+    let mut leaders = 0;
+    for n in survivors {
+        leaders += n.is_leader().await as usize;
+    }
+    assert_eq!(leaders, 1);
+}
+
+#[tokio::test]
+async fn ephemeral_streams_are_fast_and_forgotten() {
+    let addr = free_addr();
+    let dir = fresh_dir("ephemeral");
+    let node = mycelium::Node::bind(addr).with_data_dir(&dir).start().await.unwrap();
+    let client = Mycelium::join(addr).await.unwrap();
+    let pings = client.stream::<String>("presence").ephemeral();
+    let mut rx = pings.watch(0).await.unwrap();
+    assert_eq!(pings.append(&"a".into()).await.unwrap(), 0);
+    assert_eq!(pings.append_many(&["b".into(), "c".into()]).await.unwrap(), vec![1, 2]);
+    assert_eq!(pings.len().await.unwrap(), 3);
+    for (i, v) in ["a", "b", "c"].iter().enumerate() {
+        assert_eq!(recv(&mut rx).await, Some((i as u64, v.to_string())));
+    }
+    let durable = client.stream::<String>("presence");
+    assert_eq!(durable.len().await.unwrap(), 0, "ephemeral and durable streams are separate");
+    assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+        std::fs::read(e.path().join("raft/log")).is_ok_and(|b| b.windows(8).any(|w| w == b"presence"))
+    }), "nothing ephemeral reaches the disk");
+
+    node.shutdown();
+    drop(node);
+    let mut node = None;
+    for _ in 0..100 {
+        if let Ok(n) = mycelium::Node::bind(addr).with_data_dir(&dir).start().await {
+            node = Some(n);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let node = node.unwrap();
+    assert_eq!(node.handle().stream::<String>("presence").ephemeral().len().await.unwrap(), 0, "gone after a restart");
+}
+
+#[tokio::test]
+async fn retention_trims_by_count_age_and_on_request() {
+    let node = Mycelium::local();
+    let s = node.stream::<u64>("last3").retain(mycelium::Retention {
+        keep_last: Some(3),
+        max_age: None,
+    });
+    for i in 0..10u64 {
+        s.append(&i).await.unwrap();
+    }
+    assert_eq!(s.len().await.unwrap(), 10, "len is the next index");
+    assert_eq!(s.first().await.unwrap(), 7);
+    let mut rx = s.watch(0).await.unwrap();
+    assert_eq!(recv(&mut rx).await, Some((7, 7)), "watch starts at the first entry left");
+
+    let manual = node.stream::<u64>("manual");
+    for i in 0..5u64 {
+        manual.append(&i).await.unwrap();
+    }
+    manual.trim(3).await.unwrap();
+    assert_eq!(manual.first().await.unwrap(), 3);
+
+    let aged = node.stream::<u64>("aged").retain(mycelium::Retention {
+        keep_last: None,
+        max_age: Some(Duration::from_millis(300)),
+    });
+    aged.append(&1).await.unwrap();
+    aged.append(&2).await.unwrap();
+    for _ in 0..60 {
+        if aged.first().await.unwrap() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(aged.first().await.unwrap(), 2, "entries past max_age expire");
+    aged.append(&3).await.unwrap();
+    assert_eq!(aged.len().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn map_watch_sees_local_and_remote_changes() {
+    let cluster = start_cluster(3, "map-watch").await;
+    let a = cluster[0].handle().map::<String, u64>("w");
+    let b = Mycelium::join(cluster[2].addr).await.unwrap().map::<String, u64>("w");
+    let mut rx = b.watch().await.unwrap();
+    a.set(&"x".into(), &1).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
+    assert_eq!(got, Some(("x".to_string(), Some(1))), "a remote set reaches a watcher");
+    b.set(&"y".into(), &2).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
+    assert_eq!(got, Some(("y".to_string(), Some(2))), "so does a local one");
+    a.remove(&"x".into()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
+    assert_eq!(got, Some(("x".to_string(), None)), "removes arrive as None");
+}
+
+#[tokio::test]
+async fn tailnet_discovery_reads_tailscale_status() {
+    match mycelium::tailnet_peers(7777) {
+        Ok(peers) => {
+            for p in &peers {
+                assert_eq!(p.addr.port(), 7777);
+                assert!(p.name.as_deref().is_some_and(|n| n.contains('.')), "a full tailnet name: {p:?}");
+            }
+        }
+        Err(e) => eprintln!("skipped, no tailscale here: {e}"),
+    }
 }

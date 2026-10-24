@@ -65,6 +65,17 @@ impl Identity {
             .ok_or_else(|| format!("no private key in {}", key.display()))?;
         Ok(Self { certs, key })
     }
+
+    /// The first DNS name on this node's certificate: how peers know it.
+    pub fn name(&self) -> Option<String> {
+        dns_names(&self.certs[0]).into_iter().next()
+    }
+}
+
+fn dns_names(der: &CertificateDer<'_>) -> Vec<String> {
+    webpki::EndEntityCert::try_from(der)
+        .map(|c| c.valid_dns_names().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 fn system_roots() -> Result<Arc<RootCertStore>> {
@@ -146,19 +157,13 @@ pub(crate) fn client_endpoint(target: SocketAddr) -> Result<Endpoint> {
     Ok(Endpoint::client(any)?)
 }
 
-/// Whether the caller presented a (root-verified) certificate for `name`.
-pub(crate) fn caller_is(conn: &Connection, name: &str) -> bool {
-    let Some(certs) = conn
-        .peer_identity()
+/// DNS names on the caller's certificate. Only root-verified certificates
+/// get this far (PeerCerts), so the names can be trusted. Empty: no certificate.
+pub(crate) fn caller_names(conn: &Connection) -> Vec<String> {
+    conn.peer_identity()
         .and_then(|i| i.downcast::<Vec<CertificateDer<'static>>>().ok())
-    else {
-        return false;
-    };
-    let (Some(leaf), Ok(want)) = (certs.first(), ServerName::try_from(name.to_string())) else {
-        return false;
-    };
-    rustls::server::ParsedCertificate::try_from(leaf)
-        .is_ok_and(|c| rustls::client::verify_server_name(&c, &want).is_ok())
+        .and_then(|certs| certs.first().map(dns_names))
+        .unwrap_or_default()
 }
 
 pub(crate) async fn put(send: &mut SendStream, bytes: &[u8]) -> Result<()> {

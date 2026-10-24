@@ -1,8 +1,10 @@
-//! What survives a crash: the raft log and (term, vote).
+//! What survives a crash: the raft log, (term, vote), and the latest snapshot.
 //!
-//! The log is one append-only file of records `[len u32][crc32 u32][term u64][cmd]`.
+//! `log`: a 16-byte header `[magic][base u64]`, then records
+//! `[len u32][crc32 u32][term u64][cmd]` for entries `base+1, base+2, ...`.
 //! A torn or corrupt tail is cut off on open; everything before it is intact.
-//! (term, vote) is replaced atomically: write a temp file, fsync, rename, fsync dir.
+//! `state` and `snapshot` are replaced atomically: temp file, fsync, rename,
+//! fsync the directory.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -10,23 +12,58 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const HEADER: usize = 8;
+const LOG_MAGIC: &[u8; 8] = b"MYCLOG01";
+const SNAP_MAGIC: &[u8; 8] = b"MYCSNP01";
+const LOG_HEADER: usize = 16;
+const RECORD_HEADER: usize = 8;
 
 pub(crate) struct Wal {
     file: Arc<File>,
     dir: PathBuf,
-    /// Byte offset where entry `i + 1` starts.
+    /// Index of the entry before the first one in the file.
+    base: u64,
+    /// Byte offset of each entry in the file.
     offsets: Vec<u64>,
     end: u64,
-    /// Bumped on every truncation, so a sync that raced one is not trusted.
+    /// Bumped whenever the file is cut or replaced, so a sync that raced it
+    /// is not trusted.
     pub generation: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct Snapshot {
+    pub index: u64,
+    pub term: u64,
+    pub data: Vec<u8>,
 }
 
 #[derive(Default)]
 pub(crate) struct Loaded {
+    /// Index of the entry before `entries[0]`.
+    pub base: u64,
     pub entries: Vec<(u64, Vec<u8>)>,
     pub term: u64,
     pub vote: Option<SocketAddr>,
+    pub snapshot: Option<Snapshot>,
+}
+
+fn header(base: u64) -> [u8; LOG_HEADER] {
+    let mut h = [0u8; LOG_HEADER];
+    h[..8].copy_from_slice(LOG_MAGIC);
+    h[8..].copy_from_slice(&base.to_be_bytes());
+    h
+}
+
+fn record(term: u64, cmd: &[u8]) -> Vec<u8> {
+    let len = 8 + cmd.len();
+    let mut rec = Vec::with_capacity(RECORD_HEADER + len);
+    rec.extend_from_slice(&(len as u32).to_be_bytes());
+    rec.extend_from_slice(&[0; 4]);
+    rec.extend_from_slice(&term.to_be_bytes());
+    rec.extend_from_slice(cmd);
+    let crc = crc32(&rec[RECORD_HEADER..]);
+    rec[4..8].copy_from_slice(&crc.to_be_bytes());
+    rec
 }
 
 impl Wal {
@@ -40,14 +77,26 @@ impl Wal {
             .open(&path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            file.write_all(&header(0))?;
+            file.sync_all()?;
+            bytes.extend_from_slice(&header(0));
+        }
+        if bytes.len() < LOG_HEADER || &bytes[..8] != LOG_MAGIC {
+            return Err(io::Error::other(format!(
+                "{} is not a mycelium log",
+                path.display()
+            )));
+        }
+        let base = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
 
         let mut entries = Vec::new();
         let mut offsets = Vec::new();
-        let mut at = 0usize;
-        while bytes.len() >= at + HEADER {
+        let mut at = LOG_HEADER;
+        while bytes.len() >= at + RECORD_HEADER {
             let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             let crc = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap());
-            let body = at + HEADER;
+            let body = at + RECORD_HEADER;
             if len < 8 || bytes.len() < body + len || crc32(&bytes[body..body + len]) != crc {
                 break;
             }
@@ -62,41 +111,38 @@ impl Wal {
             file.sync_all()?;
         }
         let (term, vote) = read_state(&dir.join("state"));
+        let snapshot = read_snapshot(dir)?;
         Ok((
             Wal {
                 file: Arc::new(file),
                 dir: dir.to_path_buf(),
+                base,
                 offsets,
                 end: at as u64,
                 generation: 0,
             },
             Loaded {
+                base,
                 entries,
                 term,
                 vote,
+                snapshot,
             },
         ))
     }
 
-    /// Buffered write; durable only after `sync`.
+    /// Buffered write; durable only after a sync.
     pub fn append(&mut self, term: u64, cmd: &[u8]) -> io::Result<()> {
-        let len = 8 + cmd.len();
-        let mut rec = Vec::with_capacity(HEADER + len);
-        rec.extend_from_slice(&(len as u32).to_be_bytes());
-        rec.extend_from_slice(&[0; 4]);
-        rec.extend_from_slice(&term.to_be_bytes());
-        rec.extend_from_slice(cmd);
-        let crc = crc32(&rec[HEADER..]);
-        rec[4..8].copy_from_slice(&crc.to_be_bytes());
+        let rec = record(term, cmd);
         (&*self.file).write_all(&rec)?;
         self.offsets.push(self.end);
         self.end += rec.len() as u64;
         Ok(())
     }
 
-    /// Drop entry `from` (1-based) and everything after it.
+    /// Drop entry `from` and everything after it.
     pub fn truncate(&mut self, from: u64) -> io::Result<()> {
-        let keep = (from - 1) as usize;
+        let keep = from.saturating_sub(self.base + 1) as usize;
         if keep >= self.offsets.len() {
             return Ok(());
         }
@@ -107,15 +153,41 @@ impl Wal {
         Ok(())
     }
 
+    /// Replace the log with `entries`, which follow `base`. Durable and
+    /// atomic: a crash leaves either the old log or the new one.
+    pub fn reset<'a>(
+        &mut self,
+        base: u64,
+        entries: impl IntoIterator<Item = (u64, &'a [u8])>,
+    ) -> io::Result<()> {
+        let mut buf = header(base).to_vec();
+        let mut offsets = Vec::new();
+        for (term, cmd) in entries {
+            offsets.push(buf.len() as u64);
+            buf.extend_from_slice(&record(term, cmd));
+        }
+        write_atomic(&self.dir, "log", &buf)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(self.dir.join("log"))?;
+        self.file = Arc::new(file);
+        self.base = base;
+        self.end = buf.len() as u64;
+        self.offsets = offsets;
+        self.generation += 1;
+        Ok(())
+    }
+
     pub fn file(&self) -> Arc<File> {
         self.file.clone()
     }
 
-    pub fn state_job(
-        &self,
-        term: u64,
-        vote: Option<SocketAddr>,
-    ) -> impl FnOnce() -> io::Result<()> {
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn state_job(&self, term: u64, vote: Option<SocketAddr>) -> impl FnOnce() -> io::Result<()> {
         let dir = self.dir.clone();
         move || write_state(&dir, term, vote)
     }
@@ -139,6 +211,38 @@ fn write_state(dir: &Path, term: u64, vote: Option<SocketAddr>) -> io::Result<()
     write_atomic(dir, "state", body.as_bytes())
 }
 
+/// `[magic][index][term][crc32][data]`
+pub(crate) fn write_snapshot(dir: &Path, s: &Snapshot) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(28 + s.data.len());
+    buf.extend_from_slice(SNAP_MAGIC);
+    buf.extend_from_slice(&s.index.to_be_bytes());
+    buf.extend_from_slice(&s.term.to_be_bytes());
+    buf.extend_from_slice(&crc32(&s.data).to_be_bytes());
+    buf.extend_from_slice(&s.data);
+    write_atomic(dir, "snapshot", &buf)
+}
+
+pub(crate) fn read_snapshot(dir: &Path) -> io::Result<Option<Snapshot>> {
+    let bytes = match std::fs::read(dir.join("snapshot")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // A snapshot is renamed into place whole, so a bad one is real damage.
+    if bytes.len() < 28 || &bytes[..8] != SNAP_MAGIC {
+        return Err(io::Error::other("snapshot file is damaged"));
+    }
+    let data = bytes[28..].to_vec();
+    if crc32(&data) != u32::from_be_bytes(bytes[24..28].try_into().unwrap()) {
+        return Err(io::Error::other("snapshot checksum mismatch"));
+    }
+    Ok(Some(Snapshot {
+        index: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+        term: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+        data,
+    }))
+}
+
 /// Temp file, fsync, rename, fsync the directory: all or nothing.
 pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
@@ -156,11 +260,7 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
             k += 1;
         }
         t[i] = c;
@@ -196,7 +296,7 @@ mod tests {
     fn entries_state_and_truncation_survive_reopen() {
         let d = dir("reopen");
         let (mut w, l) = Wal::open(&d).unwrap();
-        assert!(l.entries.is_empty() && l.term == 0 && l.vote.is_none());
+        assert!(l.entries.is_empty() && l.term == 0 && l.vote.is_none() && l.snapshot.is_none());
         for i in 1..=5u64 {
             w.append(i, format!("cmd{i}").as_bytes()).unwrap();
         }
@@ -211,7 +311,7 @@ mod tests {
             got,
             vec![(1, &b"cmd1"[..]), (2, b"cmd2"), (3, b"cmd3"), (9, b"new4")]
         );
-        assert_eq!(l.term, 7);
+        assert_eq!((l.base, l.term), (0, 7));
         assert_eq!(l.vote, Some("127.0.0.1:9".parse().unwrap()));
     }
 
@@ -224,22 +324,36 @@ mod tests {
         drop(w);
         let path = d.join("log");
         let len = std::fs::metadata(&path).unwrap().len();
-        OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(len - 3)
-            .unwrap();
+        OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 3).unwrap();
 
         let (mut w, l) = Wal::open(&d).unwrap();
         assert_eq!(l.entries, vec![(1, b"whole".to_vec())]);
         w.append(2, b"after").unwrap();
         drop(w);
         let (_, l) = Wal::open(&d).unwrap();
-        assert_eq!(
-            l.entries.len(),
-            2,
-            "appends after a cut tail must be readable"
-        );
+        assert_eq!(l.entries.len(), 2, "appends after a cut tail must be readable");
+    }
+
+    #[test]
+    fn reset_and_snapshot_survive_reopen() {
+        let d = dir("reset");
+        let (mut w, _) = Wal::open(&d).unwrap();
+        for i in 1..=10u64 {
+            w.append(1, &i.to_be_bytes()).unwrap();
+        }
+        let tail: Vec<(u64, Vec<u8>)> = (9..=10u64).map(|i| (1, i.to_be_bytes().to_vec())).collect();
+        w.reset(8, tail.iter().map(|(t, c)| (*t, c.as_slice()))).unwrap();
+        w.append(2, &11u64.to_be_bytes()).unwrap();
+        w.truncate(11).unwrap();
+        w.append(3, b"eleven").unwrap();
+        write_snapshot(&d, &Snapshot { index: 8, term: 1, data: b"machine".to_vec() }).unwrap();
+        drop(w);
+
+        let (_, l) = Wal::open(&d).unwrap();
+        assert_eq!(l.base, 8);
+        assert_eq!(l.entries.len(), 3);
+        assert_eq!(l.entries[2], (3, b"eleven".to_vec()));
+        let s = l.snapshot.unwrap();
+        assert_eq!((s.index, s.term, s.data.as_slice()), (8, 1, &b"machine"[..]));
     }
 }

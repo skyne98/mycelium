@@ -14,8 +14,10 @@ presence.set(&"laptop".into(), &Status::Up).await?;
 ```text
 cargo run --example hello                               # one process, no sockets
 cargo run --example hello serve   [bind]                # standalone node
-cargo run --example hello cluster <addr> <peer>...      # one node of a cluster
-cargo run --example hello join    <addr>=<cert-name>    # attach over the tailnet
+cargo run --example hello cluster <addr> <peer>...      # one node of a new cluster
+cargo run --example hello add     <addr> <via>...       # join a running cluster
+cargo run --example hello tailnet <port>                # every tailnet machine, discovered
+cargo run --example hello join    <addr>=<name>...      # attach, failing over between nodes
 ```
 
 ## The two primitives
@@ -23,11 +25,13 @@ cargo run --example hello join    <addr>=<cert-name>    # attach over the tailne
 | | `Stream<T>` | `Map<K, V>` |
 | --- | --- | --- |
 | model | one totally ordered log per name | last-writer-wins map per name (loro) |
+| durability | durable by default; `.ephemeral()` keeps it in one node's memory | durable on every node |
 | algorithm | Raft with PreVote, CheckQuorum, ReadIndex, client sessions | CRDT, push on write plus anti-entropy pull every second |
 | write accepted | once a majority holds it on disk | once it is on the local disk |
 | during a partition | majority side only; minority writes fail, never fork | every node, converges after healing |
 | reads | `len`, `watch`: linearizable / committed entries only | this replica's view |
-| API | `append`, `append_many` (atomic, one round trip), `len`, `watch(from)`, `*_raw` | `set`, `remove`, `get`, `entries` |
+| API | `append`, `append_many` (atomic, one round trip), `len`, `first`, `watch(from)`, `trim`, `*_raw` | `set`, `remove`, `get`, `entries`, `watch` |
+| bounded by | `.retain(Retention { keep_last, max_age })`, `trim(before)` | |
 
 Types are a local lens, not a wire contract: every value carries an 8-byte type
 fingerprint, and entries that do not decode as `T` are skipped and counted
@@ -35,6 +39,10 @@ fingerprint, and entries that do not decode as `T` are skipped and counted
 
 Retries are safe: each handle tags its appends with `(client, seq)`, and a
 retried append lands once and reports its original index (thesis 6.3).
+
+`Client::any([...])` connects to any of several nodes and moves to the next
+one when a node fails, for requests and for running `watch`es alike: a watch
+resumes at the next index on the new node, without gaps or repeats.
 
 ## A cluster
 
@@ -61,6 +69,17 @@ Node::cluster(my_addr, vec![
   Clients need no certificate; they can read and write, not vote.
 - **Unverified mode** (`Peer::local`, `Client::to`) is refused off loopback, by
   construction, for both nodes and clients.
+- **Membership changes at runtime**, one server at a time (thesis 4.1).
+  `Node::join(addr, via)` adds a node: it catches up as a non-voting learner,
+  then becomes a voter, so a slow joiner never stalls commits.
+  `Running::remove(addr)` takes one out; a removed leader hands over. The
+  peer list given to `Node::cluster` is used once, on first start; after that
+  membership lives in the replicated log.
+- **Discovery.** `tailnet_peers(port)` and `tailnet_self(port)` read
+  `tailscale status` and return verified peers, ready for `Node::cluster`,
+  `Node::join` or `Client::any`.
+- **Client allowlist.** `Node::allow([...names])` admits only clients whose
+  verified certificate carries one of those names. Members always pass.
 - **Any node serves clients.** Followers forward writes to the leader and ask it
   for a read index, so a client never needs to know who leads.
 - **Durability.** The Raft log is a checksummed append-only file, fsynced with
@@ -70,12 +89,19 @@ Node::cluster(my_addr, vec![
   acknowledging anything, rather than lying.
 - **Rejoining.** A node that was down, or partitioned, is repaired by the leader
   from where its log diverges; maps catch up on the next pull.
-- **Shutdown** releases the port and the files, so a node restarts in place.
+- **Compaction.** Every 10 000 entries (`Node::snapshot_every`) a node
+  snapshots its state and cuts the log behind it. A follower too far behind
+  gets the snapshot in 1 MiB chunks, then the tail. Restarts load the
+  snapshot and replay only the tail.
+- **Graceful stop.** `Running::stop()` (and `Node::serve` on Ctrl-C or
+  SIGTERM) brings the most caught-up voter up to date and tells it to
+  campaign at once (thesis 3.10), so writes pause for a round trip, not an
+  election timeout. `shutdown()` stops at once.
 
 ## What the tests prove
 
 ```text
-cargo test                     12 unit + 39 integration tests, ~15 s
+cargo test                     16 unit + 47 integration tests, ~16 s
 CHAOS_SEEDS=500 cargo test --release --lib chaos
 MYCELIUM_TEST_ADDR=<ip>:<port>=<cert-name> cargo test --release -- --ignored   # 2 cross-machine
 ```
@@ -86,15 +112,24 @@ MYCELIUM_TEST_ADDR=<ip>:<port>=<cert-name> cargo test --release -- --ignored   #
   checks: at most one leader per term, no node votes twice in a term, log
   matching, and that no committed entry ever changes. Then it heals the network
   and requires every state machine to agree. 500 seeds pass.
+  The chaos run also compacts every 7 entries and flips a node between voter
+  and learner, so snapshot transfer and membership changes run under faults.
 - **Targeted scenarios:** a partitioned leader steps down and its writes fail
   instead of hanging; a node that rejoins after a partition does not depose the
-  leader or inflate the term (PreVote); retries apply exactly once.
+  leader or inflate the term (PreVote); retries apply exactly once; a node far
+  behind is restored by snapshot and survives a restart from it; membership
+  changes refuse two servers at once, keep learners out of the quorum, and a
+  removed leader hands over; a transfer elects the target in under 200 ms.
 - **Real clusters over QUIC** (`tests/extensive.rs`): election, every entry on
   every node, failover with the log intact, writes refused without a majority,
   writes through any node, a rejoined node catching up, a whole-cluster restart
   keeping every acknowledged write, maps converging across nodes, maps taking
   writes while partitioned and healing, a remote watch surviving its node's
-  restart, and misconfigurations refused.
+  restart, misconfigurations refused, a client and its watch failing over to
+  another node, compaction with snapshot catch-up and restart, nodes joining
+  and leaving a running cluster, a graceful stop beating the election
+  timeout, ephemeral streams that never touch disk, retention by count, age
+  and trim, map watches seeing local and remote changes, tailnet discovery.
 - **Disk:** WAL reopen, truncation, a torn tail; CRC-32 against the standard check value.
 
 ## Real numbers
@@ -123,6 +158,11 @@ Failover across machines: killing the leader moved leadership to the laptop
 (term 2); writes continued through the laptop node, and the old leader rejoined
 and caught up. All three log files ended byte-identical (same SHA-256).
 
+With verified certificates: a third node joined a running two-node cluster
+with `hello add` and became a voter; SIGTERM on the leader handed leadership
+to it ("hands leadership to ..." / "leads term 2") and a `Client::any` kept
+writing through the change.
+
 Tail latency over that WiFi link is the link, not the library. A raw UDP echo
 on the same path has a p99 of 47 to 54 ms with spikes to 99 ms; requests from
 the laptop see p90 of 50 to 100 ms on some runs and not others. QUIC
@@ -139,25 +179,27 @@ measures serial appends against one batch.
 on the client side any request slower than 40 ms, with the connection's
 lost-packet count and RTT.
 
-## Not built yet
+## Limits
 
-- **Snapshots and log compaction.** The Raft log and the state machine grow
-  without bound. On restart every node replays its whole log. Fine for
-  homelab volumes, not for years of high-rate streams.
-- **Membership changes.** The peer list is fixed at start. Adding a node means
-  restarting all of them with the new list.
-- **Lagging watchers on a remote node** are served from memory, so very long
-  streams cost RAM on every node.
-- **Ephemeral (memory-only) streams** in a cluster. `Mycelium::local()` is
-  memory-only; cluster streams are always durable.
+- **Single-server membership changes only**, as the thesis recommends;
+  replacing several nodes means several steps.
+- **Snapshots are held in memory** to send to followers, and the state machine
+  is in memory too: fine for homelab volumes, not for a terabyte stream.
+- **Ephemeral streams** live on the node you are connected to: a client that
+  fails over to another node sees that node's ephemeral streams, not the old
+  one's.
+- **Map watches coalesce**: a watcher sees the latest value per key, not every
+  intermediate one.
 
 ## Layout
 
 ```text
-src/raft.rs        Raft as pure state: no sockets, no tasks, time passed in
+src/raft.rs        Raft as pure state: no sockets, no tasks, time passed in;
+                   membership, snapshots, transfer, retention live here too
 src/raft/tests.rs  deterministic whole-cluster simulation with safety checks
-src/node.rs        the runtime: elections, replication, disk, gossip, handlers
-src/wal.rs         checksummed log and atomic (term, vote)
+src/node.rs        the runtime: elections, replication, snapshots, membership,
+                   ephemeral streams, map watch, gossip, handlers
+src/wal.rs         checksummed log, atomic (term, vote), snapshot files
 src/maps.rs        loro maps, push and pull, snapshots
 src/transport.rs   QUIC, certificates, peer identity, framing
 src/lib.rs         the public API

@@ -36,6 +36,16 @@ impl Inner {
     }
 }
 
+fn values(doc: &LoroDoc) -> HashMap<String, Vec<u8>> {
+    let mut out = HashMap::new();
+    doc.get_map("m").for_each(|k, v| {
+        if let Some(v) = value(v) {
+            out.insert(k.to_string(), v);
+        }
+    });
+    out
+}
+
 fn value(v: ValueOrContainer) -> Option<Vec<u8>> {
     match v {
         ValueOrContainer::Value(LoroValue::Binary(b)) => Some(b.to_vec()),
@@ -124,11 +134,30 @@ impl Maps {
         out
     }
 
-    pub fn import(&self, name: &str, update: &[u8]) -> Result<()> {
+/// Returns the keys whose value changed.
+    // ponytail: diffs the whole map per import; use loro's event API if maps
+    // get large.
+    pub fn import(&self, name: &str, update: &[u8]) -> Result<Vec<String>> {
         let mut g = self.lock();
-        g.doc(name)?.import(update)?;
-        g.dirty.insert(name.to_string());
-        Ok(())
+        let changed = {
+            let doc = g.doc(name)?;
+            let before = values(doc);
+            doc.import(update)?;
+            let after = values(doc);
+            let mut keys: Vec<String> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|k| before.get(*k) != after.get(*k))
+                .cloned()
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        if !changed.is_empty() {
+            g.dirty.insert(name.to_string());
+        }
+        Ok(changed)
     }
 
     /// `parts[name, version, ...]` for every map held here.
@@ -171,6 +200,7 @@ impl Maps {
         Ok(parts(&pieces))
     }
 
+    #[cfg(test)]
     pub fn import_missing(&self, body: &[u8]) -> Result<()> {
         let mut b = Blobs::new(body);
         while !b.is_empty() {
@@ -178,6 +208,18 @@ impl Maps {
             self.import(&name, b.take()?)?;
         }
         Ok(())
+    }
+
+    /// Changes as (map name, keys) after importing a pull response.
+    pub fn import_all(&self, body: &[u8]) -> Result<Vec<(String, Vec<String>)>> {
+        let mut b = Blobs::new(body);
+        let mut out = Vec::new();
+        while !b.is_empty() {
+            let name = b.text()?;
+            let keys = self.import(&name, b.take()?)?;
+            out.push((name, keys));
+        }
+        Ok(out)
     }
 
     /// Snapshot every changed map to disk.

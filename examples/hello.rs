@@ -2,8 +2,10 @@
 //!
 //!   cargo run --example hello                              # one process, no sockets
 //!   cargo run --example hello serve   [bind]               # standalone node
-//!   cargo run --example hello cluster <addr> <peer>...     # one node of a cluster
-//!   cargo run --example hello join    <addr>[=name]        # attach and use
+//!   cargo run --example hello cluster <addr> <peer>...     # one node of a new cluster
+//!   cargo run --example hello add     <addr> <via>...      # join a running cluster
+//!   cargo run --example hello tailnet <port>               # cluster with every tailnet machine
+//!   cargo run --example hello join    <addr>[=name]...     # attach (fails over) and use
 //!
 //! A peer is `addr` (unverified, loopback only) or `addr=name` (verified).
 //! MYCELIUM_CERT / MYCELIUM_KEY: serve with real certificates (tailscale cert).
@@ -63,13 +65,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .serve()
                 .await?
         }
+        Some("add") => {
+            let via = args[3..].iter().map(|s| peer(s)).collect();
+            configured(Node::join(arg(2, "127.0.0.1:7777").parse()?, via))
+                .serve()
+                .await?
+        }
+        Some("tailnet") => {
+            let port: u16 = arg(2, "7777").parse()?;
+            let me = mycelium::tailnet_self(port)?;
+            let peers = mycelium::tailnet_peers(port)?;
+            println!("cluster: {} + {} peers", me.addr, peers.len());
+            configured(Node::cluster(me.addr, peers)).serve().await?
+        }
         Some("join") => {
-            let spec = arg(2, "127.0.0.1:7777");
-            let client = match spec.split_once('=') {
-                Some((addr, name)) => Client::verified(addr.parse()?, name),
-                None => Client::to(spec.parse()?),
-            };
-            run(client.connect().await?).await?
+            let specs = if args.len() > 2 { args[2..].to_vec() } else { vec!["127.0.0.1:7777".into()] };
+            run(Client::any(specs.iter().map(|s| peer(s))).connect().await?).await?
         }
         _ => run(Mycelium::local()).await?,
     }
