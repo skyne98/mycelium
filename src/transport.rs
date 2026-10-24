@@ -41,9 +41,10 @@ fn transport_config() -> TransportConfig {
     // Tailnet paths are tens of milliseconds, not quinn's 333 ms guess. This
     // also shortens the drain after close, so a restart finds its port free.
     t.initial_rtt(Duration::from_millis(100));
-    // A quiet link stays up; a dead one is noticed within the idle timeout.
-    t.keep_alive_interval(Some(Duration::from_secs(2)));
-    t.max_idle_timeout(Duration::from_secs(10).try_into().ok());
+    // A node that dies without closing is noticed within 5 s; until then a
+    // client cannot tell it from a slow one. Costs one tiny packet a second.
+    t.keep_alive_interval(Some(Duration::from_secs(1)));
+    t.max_idle_timeout(Duration::from_secs(5).try_into().ok());
     t
 }
 

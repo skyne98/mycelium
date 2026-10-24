@@ -427,6 +427,29 @@ impl Shared {
     /// Commit a command, from here or via the leader. Retries across leader
     /// changes; appends carry (client, seq), so a retry applies once.
     async fn commit(self: &Arc<Self>, cmd: Bytes, forward: Option<(u8, Vec<u8>)>) -> Result<u64> {
+        let started = Instant::now();
+        let out = self.commit_inner(cmd, forward.clone()).await;
+        if crate::tracing() && started.elapsed() > Duration::from_millis(40) {
+            let how = if forward.is_some() && !self.is_leader() {
+                "forwarded"
+            } else {
+                "local"
+            };
+            trace!(
+                "{} slow commit ({how}): {:?} -> {:?}",
+                self.me,
+                started.elapsed(),
+                out.as_ref().map(|_| ())
+            );
+        }
+        out
+    }
+
+    async fn commit_inner(
+        self: &Arc<Self>,
+        cmd: Bytes,
+        forward: Option<(u8, Vec<u8>)>,
+    ) -> Result<u64> {
         let deadline = Instant::now() + DEADLINE;
         let mut rx = self.changed.subscribe();
         let mut why = String::from("no leader");
@@ -1215,7 +1238,19 @@ impl Shared {
                     } else {
                         2 * RPC_TIMEOUT
                     };
-                    if let Ok(out) = self.rpc(&link, APPEND_ENTRIES, req.encode(), timeout).await {
+                    let sent = self.rpc(&link, APPEND_ENTRIES, req.encode(), timeout).await;
+                    if crate::tracing()
+                        && !req.entries.is_empty()
+                        && sent_at.elapsed() > Duration::from_millis(40)
+                    {
+                        trace!(
+                            "{} slow append to {peer}: {:?}, {} entries",
+                            self.me,
+                            sent_at.elapsed(),
+                            req.entries.len()
+                        );
+                    }
+                    if let Ok(out) = sent {
                         if let Ok(resp) = AppendResp::decode(&out) {
                             let moved = {
                                 let mut c = self.core();
@@ -1467,6 +1502,19 @@ impl Shared {
 
     /// Term, vote and the log up to `idx` are durable.
     async fn persisted(&self, idx: u64) -> Result<()> {
+        let started = Instant::now();
+        let out = self.persisted_inner(idx).await;
+        if crate::tracing() && started.elapsed() > Duration::from_millis(40) {
+            trace!(
+                "{} slow fsync wait for {idx}: {:?}",
+                self.me,
+                started.elapsed()
+            );
+        }
+        out
+    }
+
+    async fn persisted_inner(&self, idx: u64) -> Result<()> {
         let mut rx = self.changed.subscribe();
         let deadline = Instant::now() + DEADLINE;
         loop {
