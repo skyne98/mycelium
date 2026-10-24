@@ -25,6 +25,10 @@ use tokio::sync::oneshot;
 /// Election timeouts are drawn from [ELECTION_MIN, 2 * ELECTION_MIN).
 pub(crate) const ELECTION_MIN: Duration = Duration::from_millis(1000);
 pub(crate) const HEARTBEAT: Duration = Duration::from_millis(100);
+/// A leader steps down after this long without hearing from a majority: the
+/// longest election timeout, so a one-second WiFi stall does not depose it.
+/// Safety does not depend on it; reads confirm leadership every time.
+const CHECK_QUORUM: Duration = Duration::from_millis(2 * ELECTION_MIN.as_millis() as u64);
 /// Largest single append, so any batch fits a frame.
 pub(crate) const MAX_ENTRY: usize = 16 << 20;
 /// Take a snapshot after this many applied entries, by default.
@@ -982,7 +986,7 @@ impl Core {
                 .filter(|m| {
                     m.addr == self.me
                         || self.progress.get(&m.addr).is_some_and(|p| {
-                            now.saturating_duration_since(p.last_ack) < ELECTION_MIN
+                            now.saturating_duration_since(p.last_ack) < CHECK_QUORUM
                         })
                 })
                 .count();

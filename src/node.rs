@@ -293,7 +293,17 @@ impl Shared {
         if self.is_leader() {
             let _ = self.transfer(Instant::now() + 2 * raft::ELECTION_MIN).await;
         }
+        let ep = self
+            .endpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.shutdown();
+        // Let the close reach every client and peer before the process exits,
+        // or they only notice at the idle timeout.
+        if let Some(ep) = ep {
+            let _ = tokio::time::timeout(Duration::from_secs(1), ep.wait_idle()).await;
+        }
     }
 
     pub fn shutdown(&self) {

@@ -57,7 +57,10 @@ async fn main() -> mycelium::Result<()> {
     let mut seen = HashSet::new();
     let mut landed_unsure = 0;
     for want in 0..len {
-        let got = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await.ok().flatten();
+        let got = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .ok()
+            .flatten();
         let (idx, v) = got.ok_or_else(|| format!("watch stopped at {want} of {len}"))?;
         if idx != want {
             return Err(format!("watch skipped from {want} to {idx}").into());
