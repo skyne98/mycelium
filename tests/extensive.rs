@@ -1786,3 +1786,78 @@ async fn type_tag_names_a_renamed_type_and_separates_namesakes() {
         Some(Renamed { celsius: 9.0 })
     );
 }
+
+#[tokio::test]
+async fn status_shows_roles_progress_and_lag() {
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    let dir = fresh_dir("status");
+    let nodes = start_cluster_with(&addrs, &dir, 10_000).await;
+    let l = leader_of(&nodes).await;
+    let s = nodes[l].handle().stream::<u64>("st");
+    for i in 0..5u64 {
+        append_when_ready(&s, &i).await;
+    }
+
+    let st = nodes[l].status();
+    assert_eq!(st.role, mycelium::Role::Leader);
+    assert_eq!(st.leader, Some(addrs[l]));
+    assert!(
+        st.commit >= 6 && st.applied == st.commit,
+        "5 appends + the leader's no-op: {st}"
+    );
+    assert_eq!(st.members.len(), 3);
+    eventually("every member caught up, as the leader sees it", || async {
+        let st = nodes[l].status();
+        st.members.iter().all(|m| m.matched == Some(st.last_index))
+    })
+    .await;
+    let st = nodes[l].status();
+    for m in st.members.iter().filter(|m| m.addr != addrs[l]) {
+        assert!(
+            m.last_heard.is_some_and(|t| t < Duration::from_secs(1)),
+            "{st}"
+        );
+    }
+    let report = st.to_string();
+    assert!(
+        report.contains("Leader") && report.contains("behind 0"),
+        "{report}"
+    );
+
+    let f = (0..3).find(|i| *i != l).unwrap();
+    let fs = nodes[f].status();
+    assert_eq!(fs.role, mycelium::Role::Follower);
+    assert_eq!(fs.leader, Some(addrs[l]));
+    assert!(
+        fs.members.iter().all(|m| m.matched.is_none()),
+        "followers do not track others"
+    );
+
+    // Over the wire, from any node.
+    let remote = Mycelium::join(addrs[f])
+        .await
+        .unwrap()
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(remote.addr, addrs[f]);
+    assert_eq!(remote.leader, Some(addrs[l]));
+
+    // A member that is down shows up as behind and not heard from.
+    nodes[f].shutdown();
+    for i in 5..10u64 {
+        append_when_ready(&s, &i).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let st = nodes[l].status();
+    let down = st.members.iter().find(|m| m.addr == addrs[f]).unwrap();
+    assert!(down.matched.unwrap() < st.last_index, "{st}");
+    assert!(
+        down.last_heard.unwrap() >= Duration::from_millis(250),
+        "{st}"
+    );
+    assert!(
+        nodes[f].status().stopped.is_some(),
+        "a shut-down node says so"
+    );
+}

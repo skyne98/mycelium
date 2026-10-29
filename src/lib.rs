@@ -510,6 +510,13 @@ impl Backend {
             Backend::Remote(r) => node::decode_members(&r.call(node::MEMBERS, Vec::new()).await?),
         }
     }
+
+    async fn status(&self) -> Result<Status> {
+        match self {
+            Backend::Local(s) => Ok(s.status()),
+            Backend::Remote(r) => node::decode_status(&r.call(node::STATUS, Vec::new()).await?),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ handles
@@ -841,6 +848,86 @@ impl Mycelium {
             .map(Member::from)
             .collect())
     }
+
+    /// The status of the node this handle talks to. Ask a leader for every
+    /// member's lag; a follower knows only its own progress.
+    pub async fn status(&self) -> Result<Status> {
+        self.backend.status().await
+    }
+}
+
+/// What a node is doing right now. `Display` prints a short report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub addr: SocketAddr,
+    pub role: Role,
+    pub term: u64,
+    /// Who this node believes leads. None during an election.
+    pub leader: Option<SocketAddr>,
+    /// The newest entry in this node's log, committed or not.
+    pub last_index: u64,
+    /// Entries up to here are on a majority and will never change.
+    pub commit: u64,
+    /// Entries up to here are in this node's streams.
+    pub applied: u64,
+    /// Entries up to here were compacted into the snapshot.
+    pub snapshot: u64,
+    pub members: Vec<MemberStatus>,
+    /// Why this node stopped taking part (shutdown, a failed disk), if it did.
+    pub stopped: Option<String>,
+}
+
+/// One member, as this node sees it. Replication progress is known only on
+/// the leader; elsewhere `matched` and `last_heard` are None.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberStatus {
+    pub addr: SocketAddr,
+    pub name: Option<String>,
+    pub voter: bool,
+    /// The last log index known to be on that node's disk.
+    pub matched: Option<u64>,
+    /// How long ago it last answered the leader.
+    pub last_heard: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Leader,
+    Follower,
+    Candidate,
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let leader = self.leader.map_or("none".into(), |l| l.to_string());
+        writeln!(
+            f,
+            "{} {:?}, term {}, leader {leader}",
+            self.addr, self.role, self.term
+        )?;
+        write!(
+            f,
+            "log {} (commit {}, applied {}, snapshot {})",
+            self.last_index, self.commit, self.applied, self.snapshot
+        )?;
+        if let Some(why) = &self.stopped {
+            write!(f, ", stopped: {why}")?;
+        }
+        for m in &self.members {
+            let kind = if m.voter { "voter" } else { "learner" };
+            write!(f, "\n  {} {kind}", m.addr)?;
+            if let Some(n) = &m.name {
+                write!(f, " ({n})")?;
+            }
+            if let Some(i) = m.matched {
+                write!(f, ", behind {}", self.last_index.saturating_sub(i))?;
+            }
+            if let Some(t) = m.last_heard {
+                write!(f, ", heard {}ms ago", t.as_millis())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A member of the cluster.
@@ -1152,6 +1239,12 @@ impl Running {
         Mycelium::with(Backend::Local(self.shared.clone()))
     }
 
+    /// Role, term, commit progress, and on the leader how far behind each
+    /// member is. `println!("{}", running.status())` for a quick report.
+    pub fn status(&self) -> Status {
+        self.shared.status()
+    }
+
     /// The membership this node has.
     pub fn members(&self) -> Vec<Member> {
         self.shared
@@ -1220,5 +1313,48 @@ mod tests {
         assert_eq!(fingerprint(""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fingerprint("a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fingerprint("foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn status_roundtrips_over_the_wire() {
+        let s = Status {
+            addr: "100.1.2.3:7777".parse().unwrap(),
+            role: Role::Leader,
+            term: 7,
+            leader: Some("100.1.2.3:7777".parse().unwrap()),
+            last_index: 42,
+            commit: 41,
+            applied: 40,
+            snapshot: 10,
+            members: vec![
+                MemberStatus {
+                    addr: "100.1.2.3:7777".parse().unwrap(),
+                    name: Some("a.ts.net".into()),
+                    voter: true,
+                    matched: Some(42),
+                    last_heard: None,
+                },
+                MemberStatus {
+                    addr: "[fd7a::1]:7777".parse().unwrap(),
+                    name: None,
+                    voter: false,
+                    matched: None,
+                    last_heard: Some(Duration::from_millis(120)),
+                },
+            ],
+            stopped: Some("disk full".into()),
+        };
+        assert_eq!(node::decode_status(&node::encode_status(&s)).unwrap(), s);
+        let quiet = Status {
+            leader: None,
+            members: Vec::new(),
+            stopped: None,
+            role: Role::Candidate,
+            ..s
+        };
+        assert_eq!(
+            node::decode_status(&node::encode_status(&quiet)).unwrap(),
+            quiet
+        );
     }
 }

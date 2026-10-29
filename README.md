@@ -189,6 +189,19 @@ measures serial appends against one batch.
 
 ## Debugging
 
+`running.status()` (in process) or `node.status().await` (over the network,
+any node) reports role, term, leader, log, commit and snapshot indices, and on
+the leader how far behind each member is and when it last answered:
+
+```text
+$ cargo run --example hello status 100.79.55.103:7802=fox-workstation.ts.net
+100.79.55.103:7802 Leader, term 4, leader 100.79.55.103:7802
+log 1412 (commit 1412, applied 1412, snapshot 0)
+  100.79.55.103:7801 voter (fox-workstation.ts.net), behind 0, heard 38ms ago
+  100.79.55.103:7802 voter (fox-workstation.ts.net), behind 0
+  100.122.25.53:7803 voter (fox-laptop.ts.net), behind 0, heard 41ms ago
+```
+
 `MYCELIUM_TRACE=1` prints elections, leadership changes and disk failures, and
 on the client side any request slower than 40 ms, with the connection's
 lost-packet count and RTT.

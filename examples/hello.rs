@@ -6,6 +6,7 @@
 //!   cargo run --example hello add     <addr> <via>...      # join a running cluster
 //!   cargo run --example hello tailnet <port>               # cluster with every tailnet machine
 //!   cargo run --example hello join    <addr>[=name]...     # attach (fails over) and use
+//!   cargo run --example hello status  <addr>[=name]        # role, term, commit, lag
 //!
 //! A peer is `addr` (unverified, loopback only) or `addr=name` (verified).
 //! MYCELIUM_CERT / MYCELIUM_KEY: serve with real certificates (tailscale cert).
@@ -77,6 +78,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let peers = mycelium::tailnet_peers(port)?;
             println!("cluster: {} + {} peers", me.addr, peers.len());
             configured(Node::cluster(me.addr, peers)).serve().await?
+        }
+        Some("status") => {
+            let spec = arg(2, "127.0.0.1:7777");
+            let node = Client::any([peer(&spec)]).connect().await?;
+            println!("{}", node.status().await?);
         }
         Some("join") => {
             let specs = if args.len() > 2 {

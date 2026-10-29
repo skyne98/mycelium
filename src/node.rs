@@ -34,6 +34,7 @@ pub(crate) const MAP_WATCH: u8 = 8;
 pub(crate) const MEMBERS: u8 = 9;
 pub(crate) const TRIM: u8 = 10;
 pub(crate) const FIRST: u8 = 11;
+pub(crate) const STATUS: u8 = 12;
 // Peer requests: only from a member of the cluster.
 const VOTE: u8 = 20;
 const APPEND_ENTRIES: u8 = 21;
@@ -156,6 +157,84 @@ pub(crate) fn encode_members(c: &[Member]) -> Vec<u8> {
 
 pub(crate) fn decode_members(b: &[u8]) -> Result<Vec<Member>> {
     raft::decode_config(b)
+}
+
+const NONE: u64 = u64::MAX;
+
+/// `parts[addr, role, term, leader, last, commit, applied, snapshot, stopped,
+/// then per member: addr, name, voter, matched, heard_ms]`. NONE marks absent.
+pub(crate) fn encode_status(s: &crate::Status) -> Vec<u8> {
+    let opt = |v: Option<u64>| v.unwrap_or(NONE).to_be_bytes();
+    let role = [match s.role {
+        crate::Role::Leader => 0u8,
+        crate::Role::Follower => 1,
+        crate::Role::Candidate => 2,
+    }];
+    let head: Vec<Vec<u8>> = vec![
+        s.addr.to_string().into_bytes(),
+        role.to_vec(),
+        s.term.to_be_bytes().to_vec(),
+        s.leader
+            .map(|l| l.to_string())
+            .unwrap_or_default()
+            .into_bytes(),
+        s.last_index.to_be_bytes().to_vec(),
+        s.commit.to_be_bytes().to_vec(),
+        s.applied.to_be_bytes().to_vec(),
+        s.snapshot.to_be_bytes().to_vec(),
+        s.stopped.clone().unwrap_or_default().into_bytes(),
+    ];
+    let mut pieces: Vec<Vec<u8>> = head;
+    for m in &s.members {
+        pieces.push(m.addr.to_string().into_bytes());
+        pieces.push(m.name.clone().unwrap_or_default().into_bytes());
+        pieces.push(vec![m.voter as u8]);
+        pieces.push(opt(m.matched).to_vec());
+        pieces.push(opt(m.last_heard.map(|d| d.as_millis() as u64)).to_vec());
+    }
+    let refs: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+    parts(&refs)
+}
+
+pub(crate) fn decode_status(body: &[u8]) -> Result<crate::Status> {
+    let mut b = Blobs::new(body);
+    let opt = |v: u64| (v != NONE).then_some(v);
+    let text = |s: String| (!s.is_empty()).then_some(s);
+    let addr = b.text()?.parse()?;
+    let role = match b.take()? {
+        [0] => crate::Role::Leader,
+        [2] => crate::Role::Candidate,
+        _ => crate::Role::Follower,
+    };
+    let term = b.u64()?;
+    let leader = match b.text()? {
+        s if s.is_empty() => None,
+        s => Some(s.parse()?),
+    };
+    let (last_index, commit, applied, snapshot) = (b.u64()?, b.u64()?, b.u64()?, b.u64()?);
+    let stopped = text(b.text()?);
+    let mut members = Vec::new();
+    while !b.is_empty() {
+        members.push(crate::MemberStatus {
+            addr: b.text()?.parse()?,
+            name: text(b.text()?),
+            voter: b.take()? == [1],
+            matched: opt(b.u64()?),
+            last_heard: opt(b.u64()?).map(Duration::from_millis),
+        });
+    }
+    Ok(crate::Status {
+        addr,
+        role,
+        term,
+        leader,
+        last_index,
+        commit,
+        applied,
+        snapshot,
+        members,
+        stopped,
+    })
 }
 
 pub(crate) fn start(cfg: Config) -> Result<Arc<Shared>> {
@@ -285,6 +364,49 @@ impl Shared {
 
     pub fn members(&self) -> Vec<Member> {
         self.core().config.clone()
+    }
+
+    pub fn status(&self) -> crate::Status {
+        let c = self.core();
+        let now = Instant::now();
+        let leading = c.is_leader();
+        let members = c
+            .config
+            .iter()
+            .map(|m| {
+                let me = m.addr == self.me;
+                let p = c.progress.get(&m.addr);
+                crate::MemberStatus {
+                    addr: m.addr,
+                    name: m.name.clone(),
+                    voter: m.voter,
+                    matched: match (leading, me) {
+                        (true, true) => Some(c.durable),
+                        (true, false) => p.map(|p| p.matched),
+                        _ => None,
+                    },
+                    last_heard: p
+                        .filter(|_| leading && !me)
+                        .map(|p| now.saturating_duration_since(p.last_ack)),
+                }
+            })
+            .collect();
+        crate::Status {
+            addr: self.me,
+            role: match c.role {
+                Role::Leader => crate::Role::Leader,
+                Role::Follower => crate::Role::Follower,
+                Role::Candidate => crate::Role::Candidate,
+            },
+            term: c.term,
+            leader: c.leader,
+            last_index: c.last_index(),
+            commit: c.commit,
+            applied: c.applied,
+            snapshot: c.snap_index,
+            members,
+            stopped: c.io_error.clone(),
+        }
     }
 
     /// Hand leadership to the most caught-up voter, then stop. Without a
@@ -1756,6 +1878,7 @@ impl Shared {
                 return Ok(parts(&pieces));
             }
             MEMBERS => return Ok(encode_members(&self.members())),
+            STATUS => return Ok(encode_status(&self.status())),
             _ => {}
         }
         let Caller::Peer(who) = caller else {
