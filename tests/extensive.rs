@@ -1687,3 +1687,102 @@ async fn tailnet_discovery_reads_tailscale_status() {
         Err(e) => eprintln!("skipped, no tailscale here: {e}"),
     }
 }
+
+// ---------------------------------------------------------------- type tags
+
+mod v1 {
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    pub struct Reading {
+        pub celsius: f64,
+    }
+}
+
+mod v2 {
+    pub mod sensors {
+        /// Same name, moved to another module: the tag is still "Reading".
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        pub struct Reading {
+            pub celsius: f64,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Renamed {
+    celsius: f64,
+}
+
+#[tokio::test]
+async fn a_type_moved_to_another_module_still_reads() {
+    let node = Mycelium::local();
+    let old = node.stream::<v1::Reading>("temps");
+    old.append(&v1::Reading { celsius: 21.5 }).await.unwrap();
+    let new = node.stream::<v2::sensors::Reading>("temps");
+    let mut rx = new.watch(0).await.unwrap();
+    assert_eq!(
+        recv(&mut rx).await,
+        Some((0, v2::sensors::Reading { celsius: 21.5 }))
+    );
+    assert_eq!(new.skipped(), 0);
+
+    let m_old = node.map::<String, v1::Reading>("last");
+    m_old
+        .set(&"lab".into(), &v1::Reading { celsius: 3.0 })
+        .await
+        .unwrap();
+    let m_new = node.map::<String, v2::sensors::Reading>("last");
+    assert_eq!(
+        m_new.get(&"lab".into()).await.unwrap(),
+        Some(v2::sensors::Reading { celsius: 3.0 })
+    );
+}
+
+#[tokio::test]
+async fn type_tag_names_a_renamed_type_and_separates_namesakes() {
+    let node = Mycelium::local();
+    let old = node.stream::<v1::Reading>("renamed");
+    old.append(&v1::Reading { celsius: 7.0 }).await.unwrap();
+    let skips = node.stream::<Renamed>("renamed");
+    let mut rx = skips.watch(0).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "a different name is a different type"
+    );
+    let tagged = node.stream::<Renamed>("renamed").type_tag("Reading");
+    let mut rx = tagged.watch(0).await.unwrap();
+    assert_eq!(
+        recv(&mut rx).await,
+        Some((0, Renamed { celsius: 7.0 })),
+        "the old tag reads it"
+    );
+
+    // Two types with one name stay apart once one of them is tagged.
+    let a = node.stream::<v1::Reading>("mixed");
+    let b = node
+        .stream::<v2::sensors::Reading>("mixed")
+        .type_tag("SensorReading");
+    a.append(&v1::Reading { celsius: 1.0 }).await.unwrap();
+    b.append(&v2::sensors::Reading { celsius: 2.0 })
+        .await
+        .unwrap();
+    let mut ra = a.watch(0).await.unwrap();
+    assert_eq!(recv(&mut ra).await, Some((0, v1::Reading { celsius: 1.0 })));
+    assert!(tokio::time::timeout(Duration::from_millis(300), ra.recv())
+        .await
+        .is_err());
+    assert_eq!(a.skipped(), 1, "the tagged entry was skipped, not misread");
+
+    let m = node
+        .map::<String, Renamed>("tagged-map")
+        .type_tag("Reading");
+    node.map::<String, v1::Reading>("tagged-map")
+        .set(&"x".into(), &v1::Reading { celsius: 9.0 })
+        .await
+        .unwrap();
+    assert_eq!(
+        m.get(&"x".into()).await.unwrap(),
+        Some(Renamed { celsius: 9.0 })
+    );
+}

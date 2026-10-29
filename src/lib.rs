@@ -98,14 +98,38 @@ impl Peer {
     }
 }
 
-// ponytail: FNV-1a of the type's name. Stable across runs and machines built
-// by the same compiler; rustc may spell names differently across versions.
-fn fingerprint<T>() -> u64 {
-    std::any::type_name::<T>()
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-        })
+/// The default type tag: the type's name with every module path and space
+/// removed, e.g. `Option<(u64, String)>`. So moving a type to another module
+/// or crate, or building with another compiler, keeps its streams readable;
+/// rustc only promises the path parts of `type_name`, not their spelling.
+/// Two different types with the same name in one stream need `type_tag`.
+fn type_tag<T>() -> String {
+    let full = std::any::type_name::<T>();
+    let mut out = String::with_capacity(full.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        out.push_str(token.rsplit("::").next().unwrap_or_default());
+        token.clear();
+    };
+    for c in full.chars() {
+        if c.is_alphanumeric() || c == '_' || c == ':' {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            if !c.is_whitespace() {
+                out.push(c);
+            }
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// FNV-1a of a type tag: fully specified, so every build agrees.
+fn fingerprint(tag: &str) -> u64 {
+    tag.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn encode<T: Serialize>(fp: u64, v: &T) -> Result<Vec<u8>> {
@@ -521,6 +545,13 @@ impl<T> Stream<T> {
         &self.name
     }
 
+    /// Name the entry type explicitly, instead of by its Rust name: for a
+    /// renamed type, or to keep two types called the same apart.
+    pub fn type_tag(mut self, tag: &str) -> Self {
+        self.fp = fingerprint(tag);
+        self
+    }
+
     /// Memory-only on the node this handle talks to: no consensus, no disk.
     pub fn ephemeral(mut self) -> Self {
         self.ephemeral = true;
@@ -652,6 +683,7 @@ impl<T: Serialize + DeserializeOwned> Stream<T> {
 /// Merged state: every node accepts writes, concurrent writes converge.
 pub struct Map<K, V> {
     name: String,
+    fp: u64,
     db: Mycelium,
     _t: PhantomData<fn() -> (K, V)>,
 }
@@ -660,13 +692,20 @@ impl<K, V> Map<K, V> {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Name the value type explicitly, instead of by its Rust name: for a
+    /// renamed type, or to keep two types called the same apart.
+    pub fn type_tag(mut self, tag: &str) -> Self {
+        self.fp = fingerprint(tag);
+        self
+    }
 }
 
 impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Map<K, V> {
     /// Returns once the write is on this node's disk; peers get it by push now
     /// and by pull within a second, even after a partition heals.
     pub async fn set(&self, key: &K, value: &V) -> Result<()> {
-        let v = encode(fingerprint::<V>(), value)?;
+        let v = encode(self.fp, value)?;
         self.db
             .backend
             .map_set(&self.name, &key_text(key)?, v)
@@ -683,7 +722,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Map<K, V>
     /// This replica's view. None also when the value was written as another type.
     pub async fn get(&self, key: &K) -> Result<Option<V>> {
         match self.db.backend.map_get(&self.name, &key_text(key)?).await? {
-            Some(bytes) => decode::<V>(fingerprint::<V>(), &bytes),
+            Some(bytes) => decode::<V>(self.fp, &bytes),
             None => Ok(None),
         }
     }
@@ -695,7 +734,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Map<K, V>
             let Some(kb) = maps::unhex(&k) else { continue };
             let (Ok((k, _)), Ok(Some(v))) = (
                 bincode::serde::decode_from_slice::<K, _>(&kb, standard()),
-                decode::<V>(fingerprint::<V>(), &v),
+                decode::<V>(self.fp, &v),
             ) else {
                 continue;
             };
@@ -713,6 +752,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Map<K, V>
     {
         let mut raw = self.db.backend.map_watch(&self.name).await?;
         let (tx, rx) = mpsc::channel(256);
+        let fp = self.fp;
         tokio::spawn(async move {
             while let Some((k, v)) = raw.recv().await {
                 let Some(kb) = maps::unhex(&k) else { continue };
@@ -720,7 +760,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Map<K, V>
                     continue;
                 };
                 let v = match v {
-                    Some(bytes) => match decode::<V>(fingerprint::<V>(), &bytes) {
+                    Some(bytes) => match decode::<V>(fp, &bytes) {
                         Ok(Some(v)) => Some(v),
                         _ => continue,
                     },
@@ -773,7 +813,7 @@ impl Mycelium {
     pub fn stream<T: Serialize + DeserializeOwned>(&self, name: &str) -> Stream<T> {
         Stream {
             name: name.to_string(),
-            fp: fingerprint::<T>(),
+            fp: fingerprint(&type_tag::<T>()),
             db: self.clone(),
             skipped: Arc::new(AtomicU64::new(0)),
             ephemeral: false,
@@ -785,6 +825,7 @@ impl Mycelium {
     pub fn map<K: Serialize, V: Serialize + DeserializeOwned>(&self, name: &str) -> Map<K, V> {
         Map {
             name: name.to_string(),
+            fp: fingerprint(&type_tag::<V>()),
             db: self.clone(),
             _t: PhantomData,
         }
@@ -1146,5 +1187,38 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.shared.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    mod deep {
+        pub mod inside {
+            pub struct Note;
+        }
+    }
+
+    #[test]
+    fn type_tags_drop_module_paths_and_spaces() {
+        assert_eq!(type_tag::<String>(), "String");
+        assert_eq!(type_tag::<Vec<u64>>(), "Vec<u64>");
+        assert_eq!(type_tag::<Option<(u64, String)>>(), "Option<(u64,String)>");
+        assert_eq!(
+            type_tag::<HashMap<String, Vec<deep::inside::Note>>>(),
+            "HashMap<String,Vec<Note>>"
+        );
+        assert_eq!(type_tag::<[u8; 4]>(), "[u8;4]");
+        assert_eq!(type_tag::<deep::inside::Note>(), "Note");
+    }
+
+    #[test]
+    fn fingerprints_are_fixed_values() {
+        // FNV-1a test vectors: a change here breaks every stored stream.
+        assert_eq!(fingerprint(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fingerprint("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fingerprint("foobar"), 0x8594_4171_f739_67e8);
     }
 }

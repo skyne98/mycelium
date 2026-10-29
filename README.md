@@ -37,6 +37,12 @@ Types are a local lens, not a wire contract: every value carries an 8-byte type
 fingerprint, and entries that do not decode as `T` are skipped and counted
 (`skipped()`), never fatal. `append_raw` / `watch_raw` see every entry as bytes.
 
+The fingerprint is a hash of the type's name without module paths, e.g.
+`Option<(u64,String)>`, so moving a type to another module or crate, or
+building with another Rust version, keeps its streams readable. For a renamed
+type, or two types that share a name, set it yourself:
+`node.stream::<Reading>("temps").type_tag("Reading")` (same for maps).
+
 Retries are safe: each handle tags its appends with `(client, seq)`, and a
 retried append lands once and reports its original index (thesis 6.3).
 
@@ -100,8 +106,11 @@ Node::cluster(my_addr, vec![
 
 ## What the tests prove
 
+CI (`.github/workflows/ci.yml`) runs rustfmt, clippy with warnings as
+errors, the full suite and 500 chaos seeds on every push.
+
 ```text
-cargo test                     16 unit + 47 integration tests, ~16 s
+cargo test                     18 unit + 49 integration tests, ~20 s
 CHAOS_SEEDS=500 cargo test --release --lib chaos
 MYCELIUM_TEST_ADDR=<ip>:<port>=<cert-name> cargo test --release -- --ignored   # 2 cross-machine
 ```
