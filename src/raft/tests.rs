@@ -153,7 +153,7 @@ impl Net {
             }
         }
         let c = &self.nodes[i];
-        if c.is_leader() && self.now_ms % 50 == 0 {
+        if c.is_leader() && self.now_ms.is_multiple_of(50) {
             let out: Vec<(SocketAddr, Outbound)> = c
                 .others()
                 .into_iter()
@@ -648,9 +648,9 @@ fn chaos_keeps_every_safety_property() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
     for seed in 1..=seeds {
-        let n = if seed % 2 == 0 { 5 } else { 3 };
+        let n = if seed.is_multiple_of(2) { 5 } else { 3 };
         let mut net = Net::new(n, seed);
-        if seed % 3 == 0 {
+        if seed.is_multiple_of(3) {
             for c in &mut net.nodes {
                 c.snapshot_every = 7;
             }

@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if conn.send_datagram(Bytes::copy_from_slice(chunk)).is_err() {
                     dropped += 1;
                 }
-                if i % 16 == 0 {
+                if i.is_multiple_of(16) {
                     tokio::task::yield_now().await;
                 }
             }

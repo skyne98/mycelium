@@ -344,8 +344,8 @@ async fn remote_two_clients_agree_on_order() {
 
     let sa = a.stream::<String>("chat");
     let sb = b.stream::<String>("chat");
-    for i in 0..10 {
-        let s = if i % 2 == 0 { &sa } else { &sb };
+    for i in 0..10u32 {
+        let s = if i.is_multiple_of(2) { &sa } else { &sb };
         s.append(&format!("m{i}")).await.unwrap();
     }
 
@@ -584,7 +584,7 @@ async fn random_operations_keep_the_invariants() {
 
     let mut expected = Vec::new();
     for step in 0..500u64 {
-        if next() % 3 == 0 {
+        if next().is_multiple_of(3) {
             m.set(&(next() % 50), &step).await.unwrap();
         } else {
             s.append(&step).await.unwrap();
